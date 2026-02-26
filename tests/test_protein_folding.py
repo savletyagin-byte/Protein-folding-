@@ -28,14 +28,14 @@ def test_local_pdb_dataset_parsing(tmp_path: Path):
     assert ex.coords.shape == (6, 3)
 
 
-def test_fit_and_evaluate_run_on_real_pdb_example(tmp_path: Path):
+def test_fit_evaluate_and_metrics(tmp_path: Path):
     pdb_file = tmp_path / "mini.pdb"
     pdb_file.write_text(PDB_TEXT)
 
     ds = RealStructureDataset.from_local_pdbs([str(pdb_file)], min_len=5)
     model = TrainableProteinModel(
         ModelConfig(
-            epochs=3,
+            epochs=4,
             batch_size=1,
             lr=5e-3,
             d_hidden=32,
@@ -43,15 +43,19 @@ def test_fit_and_evaluate_run_on_real_pdb_example(tmp_path: Path):
             dist_bins=16,
             val_split=0.5,
             early_stopping_patience=2,
+            dropout_rate=0.05,
+            curriculum=True,
+            use_swa=True,
         )
     )
     result = model.fit(ds)
 
     assert result.epochs_ran >= 1
     assert np.isfinite(result.best_val_loss)
+    assert len(result.lrs) == result.epochs_ran
 
     metrics = model.evaluate(ds)
-    assert set(metrics.keys()) == {"loss", "rmsd", "contact_precision"}
+    assert set(metrics.keys()) == {"loss", "rmsd", "contact_precision", "contact_recall", "contact_f1", "distance_mae"}
     assert np.isfinite(metrics["loss"])
 
 
@@ -65,10 +69,11 @@ def test_predict_shapes_and_ensemble_outputs():
     assert pred.confidence.shape == (6,)
     assert np.all((pred.confidence >= 0) & (pred.confidence <= 100))
 
-    ens = model.predict_ensemble("ACDEFG", n_members=3)
+    ens = model.predict_ensemble("ACDEFG", n_members=3, mc_dropout=True)
     assert ens["mean_coords"].shape == (6, 3)
     assert ens["coord_var"].shape == (6, 3)
     assert ens["mean_confidence"].shape == (6,)
+    assert ens["confidence_var"].shape == (6,)
     assert ens["members"] == 3
 
 

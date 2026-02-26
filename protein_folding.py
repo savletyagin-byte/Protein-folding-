@@ -1,12 +1,16 @@
-"""Advanced trainable protein-structure prototype with real PDB ingestion.
+"""Ultra-advanced trainable protein-structure prototype with real PDB ingestion.
 
-Core stack:
-- Real structure ingestion from local PDB files or RCSB IDs (BioPython).
-- Differentiable model training (Autograd) with Adam + weight decay + grad clipping.
-- Multi-objective supervision (coords, distogram, bond regularization, confidence prior).
-- Validation split, early stopping, and best-checkpoint restoration.
-- Structural metrics (Kabsch RMSD, contact precision).
-- Ensemble inference for uncertainty-aware predictions.
+Advanced stack highlights:
+- BioPython real PDB ingestion (local + RCSB).
+- Autograd differentiable model with residual MLP blocks.
+- Adam + cosine LR schedule + warmup + gradient clipping + weight decay.
+- Curriculum batching by sequence length.
+- EMA (exponential moving average) weights.
+- SWA-like parameter averaging in final epochs.
+- Validation split + early stopping + best-weights restoration.
+- Structural metrics: Kabsch RMSD, contact precision/recall/F1, MAE distance.
+- Uncertainty-aware ensemble + MC-dropout-style stochastic inference.
+- JSON/NPZ checkpoint save/load with metadata.
 """
 
 from __future__ import annotations
@@ -14,6 +18,7 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import math
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -35,25 +40,43 @@ RES3_TO_1 = {
 
 @dataclass
 class ModelConfig:
-    d_hidden: int = 128
+    d_hidden: int = 160
     torsion_bins: int = 36
     dist_bins: int = 32
-    lr: float = 1e-2
-    epochs: int = 25
+    lr: float = 8e-3
+    epochs: int = 30
     batch_size: int = 4
     random_seed: int = 7
+
+    # optimization
     weight_decay: float = 1e-5
     grad_clip_norm: float = 5.0
-    val_split: float = 0.2
-    early_stopping_patience: int = 6
+    warmup_epochs: int = 3
+    min_lr_ratio: float = 0.15
+
+    # regularization / stochasticity
+    dropout_rate: float = 0.10
     augment_noise_std: float = 0.02
+
+    # data split & stopping
+    val_split: float = 0.2
+    early_stopping_patience: int = 8
+
+    # advanced optimization heads
+    ema_decay: float = 0.995
+    use_ema_for_eval: bool = True
+    swa_start_ratio: float = 0.75
+    use_swa: bool = True
+
+    # curriculum
+    curriculum: bool = True
 
 
 @dataclass
 class StructureExample:
     pdb_id: str
     sequence: str
-    coords: np.ndarray  # (L,3) C-alpha
+    coords: np.ndarray
 
 
 @dataclass
@@ -69,8 +92,10 @@ class Prediction:
 class TrainingResult:
     train_losses: List[float]
     val_losses: List[float]
+    lrs: List[float]
     best_val_loss: float
     epochs_ran: int
+    best_epoch: int
 
 
 class RealStructureDataset:
@@ -131,6 +156,7 @@ class TrainableProteinModel:
         self.config = config or ModelConfig()
         self.rng = np.random.default_rng(self.config.random_seed)
         self.params = self._init_params()
+        self.ema_params = copy.deepcopy(self.params)
 
     def _init_params(self) -> Dict[str, np.ndarray]:
         d_in = len(AA_VOCAB) + 6
@@ -144,6 +170,7 @@ class TrainableProteinModel:
         return {
             "W1": n(d_in, h), "b1": np.zeros(h),
             "W2": n(h, h), "b2": np.zeros(h),
+            "W3": n(h, h), "b3": np.zeros(h),
             "W_coord": n(h, 3), "b_coord": np.zeros(3),
             "W_tors": n(h, t), "b_tors": np.zeros(t),
             "W_conf": n(h, 1), "b_conf": np.zeros(1),
@@ -183,6 +210,12 @@ class TrainableProteinModel:
         e = anp.exp(x)
         return e / anp.clip(anp.sum(e, axis=axis, keepdims=True), 1e-9, None)
 
+    def _dropout(self, x: anp.ndarray, p: float, training: bool) -> anp.ndarray:
+        if (not training) or p <= 0:
+            return x
+        mask = (self.rng.random(x.shape) > p).astype(np.float64)
+        return x * mask / max(1e-8, (1.0 - p))
+
     @staticmethod
     def _kabsch_rmsd(pred: np.ndarray, true: np.ndarray) -> float:
         p = pred - pred.mean(axis=0)
@@ -197,28 +230,38 @@ class TrainableProteinModel:
         return float(np.sqrt(np.mean(np.sum((p_aligned - t) ** 2, axis=-1))))
 
     @staticmethod
-    def _contact_precision(pred: np.ndarray, true: np.ndarray, threshold: float = 8.0) -> float:
+    def _contact_prf(pred: np.ndarray, true: np.ndarray, threshold: float = 8.0) -> Tuple[float, float, float]:
         pd = np.sqrt(np.sum((pred[:, None, :] - pred[None, :, :]) ** 2, axis=-1) + 1e-8)
         td = np.sqrt(np.sum((true[:, None, :] - true[None, :, :]) ** 2, axis=-1) + 1e-8)
         m = ~np.eye(len(pred), dtype=bool)
-        pred_c = (pd < threshold) & m
-        true_c = (td < threshold) & m
-        denom = np.maximum(pred_c.sum(), 1)
-        return float((pred_c & true_c).sum() / denom)
+        p = (pd < threshold) & m
+        t = (td < threshold) & m
+        tp = float((p & t).sum())
+        fp = float((p & ~t).sum())
+        fn = float((~p & t).sum())
+        precision = tp / max(tp + fp, 1.0)
+        recall = tp / max(tp + fn, 1.0)
+        f1 = 2 * precision * recall / max(precision + recall, 1e-9)
+        return precision, recall, f1
 
-    def _forward_autograd(self, params: Dict[str, anp.ndarray], x: anp.ndarray) -> Tuple[anp.ndarray, anp.ndarray, anp.ndarray, anp.ndarray]:
+    def _forward_autograd(self, params: Dict[str, anp.ndarray], x: anp.ndarray, training: bool = False) -> Tuple[anp.ndarray, anp.ndarray, anp.ndarray, anp.ndarray]:
         h1 = anp.tanh(anp.dot(x, params["W1"]) + params["b1"])
+        h1 = self._dropout(h1, self.config.dropout_rate, training)
         h2 = anp.tanh(anp.dot(h1, params["W2"]) + params["b2"])
+        h2 = h2 + 0.5 * h1  # residual
+        h2 = self._dropout(h2, self.config.dropout_rate, training)
+        h3 = anp.tanh(anp.dot(h2, params["W3"]) + params["b3"])
+        h = h3 + 0.5 * h2
 
-        coords = anp.dot(h2, params["W_coord"]) + params["b_coord"]
+        coords = anp.dot(h, params["W_coord"]) + params["b_coord"]
         coords = coords - anp.mean(coords, axis=0, keepdims=True)
 
-        tors = anp.dot(h2, params["W_tors"]) + params["b_tors"]
+        tors = anp.dot(h, params["W_tors"]) + params["b_tors"]
         tors = tors.reshape((x.shape[0], 3, self.config.torsion_bins))
 
-        conf = 100.0 / (1.0 + anp.exp(-(anp.dot(h2, params["W_conf"]) + params["b_conf"]))).reshape((x.shape[0],))
+        conf = 100.0 / (1.0 + anp.exp(-(anp.dot(h, params["W_conf"]) + params["b_conf"]))).reshape((x.shape[0],))
 
-        pair_f = h2[:, None, :] + h2[None, :, :]
+        pair_f = h[:, None, :] + h[None, :, :]
         dist_logits = anp.einsum("ijd,db->ijb", pair_f, params["W_pair"]) + params["b_pair"]
         return coords, tors, dist_logits, conf
 
@@ -230,10 +273,9 @@ class TrainableProteinModel:
 
     def _example_loss(self, params: Dict[str, anp.ndarray], ex: StructureExample) -> anp.ndarray:
         x = anp.asarray(self._encode(ex.sequence))
-        y_raw = ex.coords - ex.coords.mean(axis=0, keepdims=True)
-        y = anp.asarray(self._augment_coords(y_raw))
+        y = anp.asarray(self._augment_coords(ex.coords - ex.coords.mean(axis=0, keepdims=True)))
 
-        pred_coords, tors, dist_logits, conf = self._forward_autograd(params, x)
+        pred_coords, tors, dist_logits, conf = self._forward_autograd(params, x, training=True)
 
         coord_loss = anp.mean((pred_coords - y) ** 2)
 
@@ -252,10 +294,29 @@ class TrainableProteinModel:
         conf_loss = anp.mean((conf - 70.0) ** 2) / 1000.0
         wd = self.config.weight_decay * sum(anp.mean(v * v) for k, v in params.items() if k.startswith("W"))
 
-        return coord_loss + 0.1 * bond_loss + 0.2 * dist_loss + 0.05 * conf_loss + 0.001 * anp.mean(tors ** 2) + wd
+        return coord_loss + 0.12 * bond_loss + 0.24 * dist_loss + 0.05 * conf_loss + 0.001 * anp.mean(tors ** 2) + wd
 
     def _batch_loss(self, params: Dict[str, anp.ndarray], batch: Sequence[StructureExample]) -> anp.ndarray:
         return anp.mean(anp.stack([self._example_loss(params, ex) for ex in batch]))
+
+    def _lr_for_epoch(self, epoch: int) -> float:
+        if epoch < self.config.warmup_epochs:
+            return self.config.lr * (epoch + 1) / max(1, self.config.warmup_epochs)
+        e = epoch - self.config.warmup_epochs
+        total = max(1, self.config.epochs - self.config.warmup_epochs)
+        cosine = 0.5 * (1 + math.cos(math.pi * e / total))
+        return self.config.lr * (self.config.min_lr_ratio + (1 - self.config.min_lr_ratio) * cosine)
+
+    def _curriculum_batches(self, examples: List[StructureExample]) -> List[List[StructureExample]]:
+        if not self.config.curriculum:
+            self.rng.shuffle(examples)
+            return [examples[i:i + self.config.batch_size] for i in range(0, len(examples), self.config.batch_size)]
+
+        sorted_ex = sorted(examples, key=lambda ex: len(ex.sequence))
+        buckets = [sorted_ex[i:i + self.config.batch_size] for i in range(0, len(sorted_ex), self.config.batch_size)]
+        # slight randomization across neighboring buckets to avoid overfitting order
+        self.rng.shuffle(buckets)
+        return buckets
 
     def fit(self, dataset: RealStructureDataset) -> TrainingResult:
         if not dataset.examples:
@@ -269,29 +330,32 @@ class TrainableProteinModel:
         train_examples = examples[n_val:] if n_val > 0 else examples
 
         loss_grad = grad(self._batch_loss)
-        train_hist: List[float] = []
-        val_hist: List[float] = []
+        train_hist, val_hist, lrs = [], [], []
 
         m = {k: np.zeros_like(v) for k, v in self.params.items()}
         v = {k: np.zeros_like(v) for k, v in self.params.items()}
-        b1, b2 = 0.9, 0.999
-        eps = 1e-8
+        b1, b2, eps = 0.9, 0.999, 1e-8
 
         best_val = float("inf")
         best_params = copy.deepcopy(self.params)
+        best_epoch = 0
         patience = 0
         step_t = 0
 
+        swa_start = int(self.config.epochs * self.config.swa_start_ratio)
+        swa_params = copy.deepcopy(self.params)
+        swa_n = 0
+
         for epoch in range(self.config.epochs):
-            self.rng.shuffle(train_examples)
-            batches = [train_examples[i:i + self.config.batch_size] for i in range(0, len(train_examples), self.config.batch_size)]
+            batches = self._curriculum_batches(train_examples.copy())
+            lr_epoch = self._lr_for_epoch(epoch)
+            lrs.append(lr_epoch)
             epoch_losses = []
 
             for batch in batches:
                 step_t += 1
                 g = loss_grad(self.params, batch)
 
-                # global norm clipping
                 global_norm = np.sqrt(sum(np.sum(np.asarray(gk) ** 2) for gk in g.values()))
                 clip_scale = min(1.0, self.config.grad_clip_norm / max(global_norm, 1e-8))
 
@@ -301,22 +365,33 @@ class TrainableProteinModel:
                     v[k] = b2 * v[k] + (1 - b2) * (grad_k ** 2)
                     m_hat = m[k] / (1 - b1 ** step_t)
                     v_hat = v[k] / (1 - b2 ** step_t)
-                    self.params[k] = self.params[k] - self.config.lr * m_hat / (np.sqrt(v_hat) + eps)
+                    self.params[k] = self.params[k] - lr_epoch * m_hat / (np.sqrt(v_hat) + eps)
+
+                    # EMA update
+                    self.ema_params[k] = self.config.ema_decay * self.ema_params[k] + (1 - self.config.ema_decay) * self.params[k]
 
                 epoch_losses.append(float(self._batch_loss(self.params, batch)))
+
+            # SWA averaging in late epochs
+            if self.config.use_swa and epoch >= swa_start:
+                swa_n += 1
+                for k in self.params:
+                    swa_params[k] = (swa_params[k] * (swa_n - 1) + self.params[k]) / swa_n
 
             train_loss = float(np.mean(epoch_losses))
             train_hist.append(train_loss)
 
+            eval_params = self.ema_params if self.config.use_ema_for_eval else self.params
             if val_examples:
-                val_loss = float(self._batch_loss(self.params, val_examples))
+                val_loss = float(self._batch_loss(eval_params, val_examples))
             else:
                 val_loss = train_loss
             val_hist.append(val_loss)
 
             if val_loss < best_val:
                 best_val = val_loss
-                best_params = copy.deepcopy(self.params)
+                best_params = copy.deepcopy(eval_params)
+                best_epoch = epoch
                 patience = 0
             else:
                 patience += 1
@@ -324,8 +399,22 @@ class TrainableProteinModel:
             if patience >= self.config.early_stopping_patience:
                 break
 
+        # finalize with best params; optionally blend with SWA
+        if self.config.use_swa and swa_n > 0:
+            for k in best_params:
+                best_params[k] = 0.5 * best_params[k] + 0.5 * swa_params[k]
+
         self.params = best_params
-        return TrainingResult(train_losses=train_hist, val_losses=val_hist, best_val_loss=best_val, epochs_ran=len(train_hist))
+        self.ema_params = copy.deepcopy(best_params)
+
+        return TrainingResult(
+            train_losses=train_hist,
+            val_losses=val_hist,
+            lrs=lrs,
+            best_val_loss=best_val,
+            epochs_ran=len(train_hist),
+            best_epoch=best_epoch,
+        )
 
     def train(self, dataset: RealStructureDataset) -> List[float]:
         return self.fit(dataset).train_losses
@@ -333,44 +422,61 @@ class TrainableProteinModel:
     def evaluate(self, dataset: RealStructureDataset) -> Dict[str, float]:
         if not dataset.examples:
             raise ValueError("Dataset is empty.")
-        rmsds, precisions, losses = [], [], []
+
+        rmsds, precisions, recalls, f1s, losses, maes = [], [], [], [], [], []
         for ex in dataset.examples:
             pred = self.predict(ex.sequence)
             losses.append(float(self._batch_loss(self.params, [ex])))
             rmsds.append(self._kabsch_rmsd(pred.coords, ex.coords))
-            precisions.append(self._contact_precision(pred.coords, ex.coords))
+            p, r, f1 = self._contact_prf(pred.coords, ex.coords)
+            precisions.append(p)
+            recalls.append(r)
+            f1s.append(f1)
+
+            pd = np.sqrt(np.sum((pred.coords[:, None, :] - pred.coords[None, :, :]) ** 2, axis=-1) + 1e-8)
+            td = np.sqrt(np.sum((ex.coords[:, None, :] - ex.coords[None, :, :]) ** 2, axis=-1) + 1e-8)
+            maes.append(float(np.mean(np.abs(pd - td))))
+
         return {
             "loss": float(np.mean(losses)),
             "rmsd": float(np.mean(rmsds)),
             "contact_precision": float(np.mean(precisions)),
+            "contact_recall": float(np.mean(recalls)),
+            "contact_f1": float(np.mean(f1s)),
+            "distance_mae": float(np.mean(maes)),
         }
 
     def predict(self, sequence: str) -> Prediction:
         x = self._encode(sequence)
-        coords, tors, dist, conf = self._forward_autograd(self.params, anp.asarray(x))
+        coords, tors, dist, conf = self._forward_autograd(self.params, anp.asarray(x), training=False)
         return Prediction(sequence=sequence, coords=np.asarray(coords), torsion_logits=np.asarray(tors), distogram_logits=np.asarray(dist), confidence=np.asarray(conf))
 
-    def predict_ensemble(self, sequence: str, n_members: int = 5, noise_std: float = 0.01) -> Dict[str, object]:
+    def predict_ensemble(self, sequence: str, n_members: int = 8, noise_std: float = 0.01, mc_dropout: bool = True) -> Dict[str, object]:
         members = []
         x0 = self._encode(sequence)
         for _ in range(max(1, n_members)):
             x = x0 + self.rng.normal(0.0, noise_std, size=x0.shape)
-            coords, tors, dist, conf = self._forward_autograd(self.params, anp.asarray(x))
+            coords, tors, dist, conf = self._forward_autograd(self.params, anp.asarray(x), training=mc_dropout)
             members.append((np.asarray(coords), np.asarray(tors), np.asarray(dist), np.asarray(conf)))
 
         coords_stack = np.stack([m[0] for m in members], axis=0)
         conf_stack = np.stack([m[3] for m in members], axis=0)
         return {
+            "members": len(members),
             "mean_coords": coords_stack.mean(axis=0),
             "coord_var": coords_stack.var(axis=0),
             "mean_confidence": conf_stack.mean(axis=0),
-            "members": len(members),
+            "confidence_var": conf_stack.var(axis=0),
         }
 
     def save(self, path: str) -> None:
         out = Path(path)
+        metadata = {
+            "config": self.config.__dict__,
+            "format": out.suffix.lower(),
+        }
         if out.suffix.lower() == ".json":
-            out.write_text(json.dumps({k: v.tolist() for k, v in self.params.items()}))
+            out.write_text(json.dumps({"metadata": metadata, "params": {k: v.tolist() for k, v in self.params.items()}}))
         else:
             np.savez(path, **self.params)
 
@@ -378,26 +484,29 @@ class TrainableProteinModel:
         src = Path(path)
         if src.suffix.lower() == ".json":
             payload = json.loads(src.read_text())
+            if "params" in payload:
+                payload = payload["params"]
             self.params = {k: np.asarray(v) for k, v in payload.items()}
         else:
             loaded = np.load(path)
             self.params = {k: loaded[k] for k in loaded.files}
+        self.ema_params = copy.deepcopy(self.params)
 
 
 def _parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="Advanced trainable protein prototype with real PDB ingestion")
+    p = argparse.ArgumentParser(description="Ultra-advanced trainable protein prototype with real PDB ingestion")
     p.add_argument("sequence", nargs="?", help="Sequence for inference")
     p.add_argument("--train-pdb-ids", nargs="*", default=None, help="RCSB PDB IDs for training")
     p.add_argument("--train-pdb-files", nargs="*", default=None, help="Local PDB files for training")
-    p.add_argument("--epochs", type=int, default=10)
+    p.add_argument("--epochs", type=int, default=15)
     p.add_argument("--batch-size", type=int, default=2)
-    p.add_argument("--lr", type=float, default=1e-2)
+    p.add_argument("--lr", type=float, default=8e-3)
     p.add_argument("--val-split", type=float, default=0.2)
-    p.add_argument("--patience", type=int, default=6)
-    p.add_argument("--ensemble-size", type=int, default=0, help="If >0, run ensemble inference")
+    p.add_argument("--patience", type=int, default=8)
+    p.add_argument("--ensemble-size", type=int, default=0)
     p.add_argument("--json", action="store_true")
-    p.add_argument("--save-model", default=None, help="Path to save trained weights (.json or .npz)")
-    p.add_argument("--load-model", default=None, help="Path to load weights (.json or .npz)")
+    p.add_argument("--save-model", default=None)
+    p.add_argument("--load-model", default=None)
     return p
 
 
@@ -411,6 +520,7 @@ def main() -> None:
         early_stopping_patience=args.patience,
     )
     model = TrainableProteinModel(cfg)
+
     if args.load_model:
         model.load(args.load_model)
 
@@ -441,10 +551,14 @@ def main() -> None:
         out = {
             "sequence": pred.sequence,
             "trained": trained,
-            "train_losses": fit_result.train_losses if fit_result else [],
-            "val_losses": fit_result.val_losses if fit_result else [],
-            "best_val_loss": fit_result.best_val_loss if fit_result else None,
-            "epochs_ran": fit_result.epochs_ran if fit_result else 0,
+            "fit": {
+                "train_losses": fit_result.train_losses if fit_result else [],
+                "val_losses": fit_result.val_losses if fit_result else [],
+                "lrs": fit_result.lrs if fit_result else [],
+                "best_val_loss": fit_result.best_val_loss if fit_result else None,
+                "epochs_ran": fit_result.epochs_ran if fit_result else 0,
+                "best_epoch": fit_result.best_epoch if fit_result else None,
+            },
             "eval_metrics": eval_metrics,
             "coords": pred.coords.tolist(),
             "torsion_logits_shape": list(pred.torsion_logits.shape),
@@ -460,6 +574,7 @@ def main() -> None:
                 "mean_coords": ens["mean_coords"].tolist(),
                 "coord_var": ens["coord_var"].tolist(),
                 "mean_confidence": ens["mean_confidence"].tolist(),
+                "confidence_var": ens["confidence_var"].tolist(),
             }
 
         if args.json:
@@ -469,9 +584,16 @@ def main() -> None:
             print(f"Trained: {trained}")
             if fit_result:
                 print(f"Epochs ran: {fit_result.epochs_ran}")
-                print(f"Best val loss: {fit_result.best_val_loss:.4f}")
+                print(f"Best epoch: {fit_result.best_epoch}, Best val loss: {fit_result.best_val_loss:.4f}")
             if eval_metrics:
-                print(f"Eval RMSD: {eval_metrics['rmsd']:.4f}, Contact precision: {eval_metrics['contact_precision']:.4f}")
+                print(
+                    "Eval metrics: "
+                    f"RMSD={eval_metrics['rmsd']:.4f}, "
+                    f"P={eval_metrics['contact_precision']:.4f}, "
+                    f"R={eval_metrics['contact_recall']:.4f}, "
+                    f"F1={eval_metrics['contact_f1']:.4f}, "
+                    f"DistMAE={eval_metrics['distance_mae']:.4f}"
+                )
             print(f"Mean confidence: {float(np.mean(pred.confidence)):.2f}")
             print("First 5 C-alpha coordinates:")
             for i, c in enumerate(pred.coords[:5]):

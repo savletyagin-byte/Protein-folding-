@@ -1,30 +1,37 @@
-# Advanced Trainable Protein Folding Prototype (Autograd + BioPython)
+# Ultra-Advanced Trainable Protein Folding Prototype (Autograd + BioPython)
 
-This project provides a trainable real-structure prototype with a stronger optimization/evaluation stack.
+This repository now includes a significantly enhanced research pipeline for trainable protein structure prediction on real PDB-derived data.
 
-## Advanced capabilities
+## Hyper-advanced features
 
-- Real PDB ingestion via BioPython:
-  - local PDB files
-  - RCSB PDB IDs (network permitting)
-- Differentiable training with Autograd
-- **Adam optimizer** with:
+- Real PDB ingestion (local files + RCSB IDs)
+- Residual MLP architecture for sequence-to-structure features
+- Advanced optimization stack:
+  - Adam optimizer
+  - cosine LR schedule with warmup
+  - gradient norm clipping
   - weight decay
-  - gradient clipping
+- Training stabilization and generalization:
   - validation split
-  - early stopping + best-checkpoint restoration
-- Multi-objective supervision:
-  - coordinate regression
-  - distogram supervision
-  - bond-length regularization
-  - confidence regularization
-- Structural evaluation metrics:
-  - Kabsch-aligned RMSD
-  - contact precision
-- Ensemble inference (`predict_ensemble`) with coordinate variance outputs
-- JSON/NPZ model save/load support
+  - early stopping
+  - best-checkpoint restoration
+  - EMA weights
+  - SWA-like late-phase parameter averaging
+  - curriculum batching by sequence length
+  - coordinate augmentation noise
+- Rich evaluation metrics:
+  - Kabsch RMSD
+  - contact precision / recall / F1
+  - pairwise distance MAE
+- Uncertainty-aware inference:
+  - ensemble prediction
+  - MC-dropout-style stochastic forward passes
+  - coordinate/confidence variance outputs
+- Checkpointing:
+  - JSON and NPZ save/load
+  - JSON checkpoint metadata
 
-## Training + inference
+## Train + infer
 
 ```bash
 python protein_folding.py ACDEFGHIK \
@@ -34,7 +41,7 @@ python protein_folding.py ACDEFGHIK \
   --save-model trained_models/demo.json
 ```
 
-## Ensemble inference
+## Ensemble / uncertainty inference
 
 ```bash
 python protein_folding.py ACDEFGHIK --load-model trained_models/demo.json --ensemble-size 8 --json
@@ -48,6 +55,6 @@ pytest -q
 
 ## Notes
 
-- This is still a compact prototype (not production-scale SOTA).
-- Binary model artifacts should remain untracked.
-- If your host reports binary-history branch issues, see `BRANCH_UPDATE_FIX.md`.
+- This is still a compact prototype and not a production-scale benchmarked foundation model.
+- Keep binary model artifacts untracked.
+- For binary-history branch issues, see `BRANCH_UPDATE_FIX.md`.
