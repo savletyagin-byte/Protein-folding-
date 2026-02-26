@@ -103,3 +103,18 @@ For a single prediction image:
 ```bash
 python protein_folding.py ACDEFGHIK   --load-model trained_models/demo.json   --save-pred-image outputs/predicted_structure.png
 ```
+
+
+## Multi-view renderer and animated rotation GIF
+
+Single prediction exports:
+
+```bash
+python protein_folding.py ACDEFGHIK   --load-model trained_models/demo.json   --save-pred-image outputs/pred.png   --save-pred-multiview outputs/pred_multiview.png   --save-pred-gif outputs/pred_rotate.gif
+```
+
+For every analyzed protein in a dataset:
+
+```bash
+python protein_folding.py ACDEFGHIK   --train-pdb-files data/sample_train.pdb   --export-analysis-images-dir outputs/analysis_images   --export-analysis-multiview   --export-analysis-gif
+```

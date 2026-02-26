@@ -109,3 +109,18 @@ def test_can_export_prediction_image(tmp_path: Path):
 
     save_structure_image(pred.coords, str(out), title="test")
     assert out.exists()
+
+
+def test_can_export_multiview_and_gif(tmp_path: Path):
+    model = TrainableProteinModel(ModelConfig(d_hidden=16, torsion_bins=12, dist_bins=12))
+    pred = model.predict("ACDEF")
+
+    from protein_folding import save_multiview_image, save_rotation_gif
+
+    mv = tmp_path / "pred_multiview.png"
+    gif = tmp_path / "pred_rotate.gif"
+    save_multiview_image(pred.coords, str(mv), title="mv")
+    save_rotation_gif(pred.coords, str(gif), title="gif", frames=12, fps=6)
+
+    assert mv.exists()
+    assert gif.exists()

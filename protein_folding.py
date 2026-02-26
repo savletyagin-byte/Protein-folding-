@@ -30,6 +30,7 @@ import numpy as np
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib import animation
 from Bio.PDB import PDBList, PDBParser, is_aa
 
 AA_VOCAB = "ACDEFGHIKLMNPQRSTVWY-X"
@@ -131,6 +132,54 @@ def save_structure_image(coords: np.ndarray, out_path: str, title: str = "Predic
     ax.set_zlabel("Z")
     plt.tight_layout()
     fig.savefig(out)
+    plt.close(fig)
+
+
+def save_multiview_image(coords: np.ndarray, out_path: str, title: str = "Predicted Protein") -> None:
+    out = Path(out_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+
+    fig = plt.figure(figsize=(12, 4), dpi=140)
+    views = [(20, 30, "Front/iso"), (20, 120, "Side"), (85, 0, "Top")]
+    x, y, z = coords[:, 0], coords[:, 1], coords[:, 2]
+
+    for i, (elev, azim, subtitle) in enumerate(views, start=1):
+        ax = fig.add_subplot(1, 3, i, projection="3d")
+        ax.plot(x, y, z, linewidth=1.8, alpha=0.9)
+        ax.scatter(x, y, z, s=10, c=range(len(coords)), cmap="viridis")
+        ax.view_init(elev=elev, azim=azim)
+        ax.set_title(subtitle)
+        ax.set_xlabel("X")
+        ax.set_ylabel("Y")
+        ax.set_zlabel("Z")
+
+    fig.suptitle(title)
+    plt.tight_layout()
+    fig.savefig(out)
+    plt.close(fig)
+
+
+def save_rotation_gif(coords: np.ndarray, out_path: str, title: str = "Predicted Protein", frames: int = 60, fps: int = 20) -> None:
+    out = Path(out_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+
+    fig = plt.figure(figsize=(6, 5), dpi=110)
+    ax = fig.add_subplot(111, projection="3d")
+    x, y, z = coords[:, 0], coords[:, 1], coords[:, 2]
+    ax.plot(x, y, z, linewidth=1.8, alpha=0.9)
+    ax.scatter(x, y, z, s=14, c=range(len(coords)), cmap="viridis")
+    ax.set_title(title)
+    ax.set_xlabel("X")
+    ax.set_ylabel("Y")
+    ax.set_zlabel("Z")
+
+    def _update(frame: int):
+        ax.view_init(elev=24, azim=(360.0 * frame / max(1, frames)))
+        return ()
+
+    ani = animation.FuncAnimation(fig, _update, frames=frames, interval=int(1000 / max(1, fps)))
+    writer = animation.PillowWriter(fps=fps)
+    ani.save(str(out), writer=writer)
     plt.close(fig)
 
 
@@ -493,13 +542,18 @@ class TrainableProteinModel:
         }
 
 
-    def evaluate_and_export_images(self, dataset: RealStructureDataset, out_dir: str) -> Dict[str, float]:
+    def evaluate_and_export_images(self, dataset: RealStructureDataset, out_dir: str, export_multiview: bool = False, export_gif: bool = False) -> Dict[str, float]:
         out = Path(out_dir)
         out.mkdir(parents=True, exist_ok=True)
         metrics = self.evaluate(dataset)
         for ex in dataset.examples:
             pred = self.predict(ex.sequence)
-            save_structure_image(pred.coords, str(out / f"{ex.pdb_id}.png"), title=f"Predicted {ex.pdb_id}")
+            stem = out / ex.pdb_id
+            save_structure_image(pred.coords, str(stem.with_suffix(".png")), title=f"Predicted {ex.pdb_id}")
+            if export_multiview:
+                save_multiview_image(pred.coords, str(out / f"{ex.pdb_id}_multiview.png"), title=f"Predicted {ex.pdb_id}")
+            if export_gif:
+                save_rotation_gif(pred.coords, str(out / f"{ex.pdb_id}_rotate.gif"), title=f"Predicted {ex.pdb_id}")
         return metrics
 
     def predict(self, sequence: str) -> Prediction:
@@ -566,6 +620,10 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--save-pred-pdb", default=None, help="Write predicted CA trace to a PDB file")
     p.add_argument("--save-pred-image", default=None, help="Write predicted structure image PNG")
     p.add_argument("--export-analysis-images-dir", default=None, help="When training, export one PNG per analyzed protein")
+    p.add_argument("--save-pred-multiview", default=None, help="Write 3-view PNG for a prediction")
+    p.add_argument("--save-pred-gif", default=None, help="Write rotating GIF for a prediction")
+    p.add_argument("--export-analysis-multiview", action="store_true", help="Also export multiview PNGs per analyzed protein")
+    p.add_argument("--export-analysis-gif", action="store_true", help="Also export rotating GIFs per analyzed protein")
     return p
 
 
@@ -592,7 +650,7 @@ def main() -> None:
         if ds.examples:
             fit_result = model.fit(ds)
             if args.export_analysis_images_dir:
-                eval_metrics = model.evaluate_and_export_images(ds, args.export_analysis_images_dir)
+                eval_metrics = model.evaluate_and_export_images(ds, args.export_analysis_images_dir, export_multiview=args.export_analysis_multiview, export_gif=args.export_analysis_gif)
             else:
                 eval_metrics = model.evaluate(ds)
             trained = True
@@ -602,7 +660,7 @@ def main() -> None:
         if ds.examples:
             fit_result = model.fit(ds)
             if args.export_analysis_images_dir:
-                eval_metrics = model.evaluate_and_export_images(ds, args.export_analysis_images_dir)
+                eval_metrics = model.evaluate_and_export_images(ds, args.export_analysis_images_dir, export_multiview=args.export_analysis_multiview, export_gif=args.export_analysis_gif)
             else:
                 eval_metrics = model.evaluate(ds)
             trained = True
@@ -619,6 +677,10 @@ def main() -> None:
             out_pdb.write_text(pred.to_pdb())
         if args.save_pred_image:
             save_structure_image(pred.coords, args.save_pred_image, title=f"Predicted {pred.sequence}")
+        if args.save_pred_multiview:
+            save_multiview_image(pred.coords, args.save_pred_multiview, title=f"Predicted {pred.sequence}")
+        if args.save_pred_gif:
+            save_rotation_gif(pred.coords, args.save_pred_gif, title=f"Predicted {pred.sequence}")
         out = {
             "sequence": pred.sequence,
             "trained": trained,
@@ -638,6 +700,8 @@ def main() -> None:
             "saved_model": args.save_model if (args.save_model and trained) else None,
             "saved_prediction_pdb": args.save_pred_pdb if args.save_pred_pdb else None,
             "saved_prediction_image": args.save_pred_image if args.save_pred_image else None,
+            "saved_prediction_multiview": args.save_pred_multiview if args.save_pred_multiview else None,
+            "saved_prediction_gif": args.save_pred_gif if args.save_pred_gif else None,
             "analysis_images_dir": args.export_analysis_images_dir if args.export_analysis_images_dir else None,
         }
 
