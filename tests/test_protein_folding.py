@@ -1,74 +1,51 @@
+from pathlib import Path
+
 import numpy as np
 
-from protein_folding import ModelConfig, OmegaFoldUltra
+from protein_folding import RealStructureDataset, TrainableProteinModel, ModelConfig
 
 
-def _model() -> OmegaFoldUltra:
-    cfg = ModelConfig(
-        d_seq=64,
-        d_msa=48,
-        d_pair=40,
-        n_evo_blocks=2,
-        n_recycles=2,
-        n_triangle_updates=1,
-        n_refine_steps=6,
-        n_diffusion_steps=4,
-        torsion_bins=24,
-        dist_bins=32,
-        n_ensemble=3,
-        anneal_steps=20,
-        msa_dropout=0.05,
-        random_seed=5,
-        allosteric_states=("inactive", "active", "intermediate"),
-    )
-    return OmegaFoldUltra(cfg)
+PDB_TEXT = """\
+ATOM      1  CA  ALA A   1      11.104  13.207   8.630  1.00 20.00           C
+ATOM      2  CA  GLY A   2      12.600  13.500   9.050  1.00 20.00           C
+ATOM      3  CA  SER A   3      13.900  12.800   9.800  1.00 20.00           C
+ATOM      4  CA  LEU A   4      15.300  13.300  10.200  1.00 20.00           C
+ATOM      5  CA  TYR A   5      16.700  12.600  10.850  1.00 20.00           C
+ATOM      6  CA  VAL A   6      18.000  13.100  11.300  1.00 20.00           C
+TER
+END
+"""
 
 
-def test_embeddings_msa_pair_shapes():
-    m = _model()
-    seq = "ACDEFGH"
-    msa = ["ACDEFGH", "ACDEYGH", "ACDEFGH"]
+def test_local_pdb_dataset_parsing(tmp_path: Path):
+    pdb_file = tmp_path / "mini.pdb"
+    pdb_file.write_text(PDB_TEXT)
 
-    s = m.sequence_embedding(seq, "inactive")
-    ms, coupling = m.msa_encoder(msa)
-    p = m.pair_representation(s, ms, coupling)
-
-    assert s.shape == (len(seq), m.config.d_seq)
-    assert ms.shape == (len(seq), m.config.d_msa)
-    assert coupling.shape == (len(seq), len(seq))
-    assert p.shape == (len(seq), len(seq), m.config.d_pair)
-    assert np.allclose(p, np.transpose(p, (1, 0, 2)), atol=1e-6)
+    ds = RealStructureDataset.from_local_pdbs([str(pdb_file)], min_len=5)
+    assert len(ds.examples) == 1
+    ex = ds.examples[0]
+    assert ex.sequence == "AGSLYV"
+    assert ex.coords.shape == (6, 3)
 
 
-def test_single_prediction_has_new_advanced_outputs():
-    m = _model()
-    seq = "ACDEFGHIK"
-    msa = [seq, "ACDEYGHIK", "ACDEFGHVK"]
-    pred = m._single(seq, msa, "active")
+def test_training_loop_runs_on_real_pdb_example(tmp_path: Path):
+    pdb_file = tmp_path / "mini.pdb"
+    pdb_file.write_text(PDB_TEXT)
 
-    assert pred.coordinates.shape == (len(seq), 3)
-    assert np.allclose(pred.coordinates.mean(axis=0), np.zeros(3), atol=1e-6)
-    assert pred.torsion_logits.shape == (len(seq), 3, m.config.torsion_bins)
-    assert pred.distogram_logits.shape == (len(seq), len(seq), m.config.dist_bins)
-    assert pred.plddt.shape == (len(seq),)
-    assert pred.pae.shape == (len(seq), len(seq))
-    assert 0 <= pred.self_consistency <= 1
-    assert np.all((pred.plddt >= 0) & (pred.plddt <= 100))
-    assert pred.quality["radius_of_gyration"] > 0
+    ds = RealStructureDataset.from_local_pdbs([str(pdb_file)], min_len=5)
+    model = TrainableProteinModel(ModelConfig(epochs=3, batch_size=1, lr=5e-3, d_hidden=32, torsion_bins=16, dist_bins=16))
+    history = model.train(ds)
+
+    assert len(history) == 3
+    assert np.isfinite(history[-1])
 
 
-def test_ensemble_ranking_and_landscape():
-    m = _model()
-    seq = "ACDEFGHIK"
-    msa = [seq, "ACDEYGHIK"]
+def test_predict_shapes():
+    model = TrainableProteinModel(ModelConfig(d_hidden=32, torsion_bins=18, dist_bins=20))
+    pred = model.predict("ACDEFG")
 
-    out = m.ensemble_sample(seq, msa, "intermediate")
-    assert len(out["members"]) == m.config.n_ensemble
-    assert out["mean_coordinates"].shape == (len(seq), 3)
-    assert out["mean_pae"].shape == (len(seq), len(seq))
-    assert len(out["ranked_indices"]) == m.config.n_ensemble
-    assert 0 <= out["best_member_index"] < m.config.n_ensemble
-    assert 0 <= out["mean_self_consistency"] <= 1
-
-    landscape = m.allosteric_landscape(seq, msa)
-    assert set(landscape.keys()) == set(m.config.allosteric_states)
+    assert pred.coords.shape == (6, 3)
+    assert pred.torsion_logits.shape == (6, 3, 18)
+    assert pred.distogram_logits.shape == (6, 6, 20)
+    assert pred.confidence.shape == (6,)
+    assert np.all((pred.confidence >= 0) & (pred.confidence <= 100))

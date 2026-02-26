@@ -1,60 +1,40 @@
-# OmegaFold-Ultra (Most-Advanced NumPy Protein Folding Prototype)
+# Trainable Protein Folding Prototype (Autograd + BioPython)
 
-This repository contains an expanded **OmegaFold-Ultra** research scaffold with a very broad feature set.
+This project now uses **more than NumPy**:
+- **BioPython** for real PDB structure ingestion/parsing
+- **Autograd** for differentiable training and gradient-based optimization
 
-## What’s included
+## What this adds
 
-- Sequence embedding
-  - token + positional + biochemical channels
-  - allosteric-state conditioning
-- MSA encoder
-  - axial row/column mixing
-  - stochastic MSA dropout
-  - coupling-map extraction
-- Pair representation
-  - sequence/MSA fusion
-  - relative/log/inverse separation priors
-  - template/contact/band priors and coupling priors
-- Structural core
-  - triangle multiplicative + triangle attention updates
-  - recycling with convergence criterion
-- Geometry stack
-  - IPA-like SE(3)-equivariant refinement
-  - diffusion-like denoising refinement
-  - annealing-based relaxation
-- Prediction heads
-  - torsion logits + decoded angles
+- Real-data training pipeline from:
+  - local PDB files
+  - RCSB PDB IDs (download + parse)
+- Trainable model that predicts:
+  - C-alpha coordinates
+  - torsion logits
   - distogram logits
-  - pLDDT-like confidence
-  - PAE-like matrix
-- Post-processing
-  - uncertainty calibration
-  - physical quality metrics (clash/bond/Rg/compactness)
-  - self-consistency score
-  - ensemble ranking and consensus
-- State-space analysis
-  - allosteric landscape generation across configured states
+  - confidence scores
+- CLI for train + infer workflows
 
-## Important note
-
-This remains a NumPy research prototype with random initialization and no learned weights.
-
-## Usage
+## Train on real PDB IDs + infer
 
 ```bash
-python protein_folding.py ACDEFGHIK --msa ACDEFGHIK ACDEYGHIK ACDEFGHVK --state active
+python protein_folding.py ACDEFGHIK \
+  --train-pdb-ids 1ubq 1crn \
+  --epochs 10 --batch-size 2 --lr 0.01
 ```
 
-All states:
+## Train on local PDB files
 
 ```bash
-python protein_folding.py ACDEFGHIK --state all
+python protein_folding.py ACDEFGHIK \
+  --train-pdb-files ./data/1ubq.pdb ./data/1crn.pdb
 ```
 
-JSON output:
+## Inference only
 
 ```bash
-python protein_folding.py ACDEFGHIK --json
+python protein_folding.py ACDEFGHIK
 ```
 
 ## Tests
@@ -62,3 +42,8 @@ python protein_folding.py ACDEFGHIK --json
 ```bash
 pytest -q
 ```
+
+## Notes
+
+- This remains a compact prototype and not a production-grade, benchmarked system.
+- RCSB download success depends on network availability.

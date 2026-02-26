@@ -1,18 +1,10 @@
-"""OmegaFold-Ultra: an extensive NumPy protein-structure research prototype.
+"""Trainable protein-structure prototype with real PDB data support.
 
-This code intentionally combines many architecture ideas into one runnable scaffold:
-- sequence/state/biochemical embeddings
-- MSA encoder with axial mixing + dropout + coupling map
-- pair representation with multiple priors
-- triangle updates + recycling
-- SE(3)-equivariant IPA-like refinement
-- diffusion denoising refinement
-- torsion/distogram/pLDDT/PAE heads
-- uncertainty calibration and self-consistency scoring
-- lightweight torsion-space annealing relaxation
-- ensemble ranking, clustering, and allosteric landscape modeling
-
-It is an untrained prototype intended for experimentation and education.
+Key upgrades:
+- Uses BioPython for real PDB structure ingestion (not NumPy-only).
+- Uses Autograd to train model parameters with gradient descent.
+- Includes dataset builder from RCSB PDB IDs and local PDB files.
+- Predicts C-alpha coordinates, torsion logits, distogram logits, and confidence.
 """
 
 from __future__ import annotations
@@ -20,122 +12,142 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
+import tempfile
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
+import autograd.numpy as anp
+from autograd import grad
 import numpy as np
+from Bio.PDB import PDBList, PDBParser, is_aa
 
 AA_VOCAB = "ACDEFGHIKLMNPQRSTVWY-X"
 AA_TO_IDX = {a: i for i, a in enumerate(AA_VOCAB)}
+RES3_TO_1 = {
+    "ALA": "A", "ARG": "R", "ASN": "N", "ASP": "D", "CYS": "C", "GLN": "Q", "GLU": "E", "GLY": "G",
+    "HIS": "H", "ILE": "I", "LEU": "L", "LYS": "K", "MET": "M", "PHE": "F", "PRO": "P", "SER": "S",
+    "THR": "T", "TRP": "W", "TYR": "Y", "VAL": "V",
+}
 
 
 @dataclass
 class ModelConfig:
-    d_seq: int = 256
-    d_msa: int = 192
-    d_pair: int = 144
-    n_evo_blocks: int = 7
-    n_recycles: int = 5
-    n_triangle_updates: int = 2
-    n_refine_steps: int = 32
-    n_diffusion_steps: int = 20
-    torsion_bins: int = 72
-    dist_bins: int = 96
-    n_ensemble: int = 10
-    msa_dropout: float = 0.1
-    recycle_tol: float = 8e-5
-    anneal_steps: int = 120
-    anneal_temp0: float = 1.5
-    random_seed: Optional[int] = 31
-    allosteric_states: Tuple[str, ...] = (
-        "inactive",
-        "active",
-        "intermediate",
-        "agonist-bound",
-        "inhibitor-bound",
-        "gprotein-coupled",
-    )
+    d_hidden: int = 128
+    torsion_bins: int = 36
+    dist_bins: int = 32
+    lr: float = 1e-2
+    epochs: int = 25
+    batch_size: int = 4
+    random_seed: int = 7
+
+
+@dataclass
+class StructureExample:
+    pdb_id: str
+    sequence: str
+    coords: np.ndarray  # (L,3) C-alpha
 
 
 @dataclass
 class Prediction:
     sequence: str
-    state: str
-    coordinates: np.ndarray
+    coords: np.ndarray
     torsion_logits: np.ndarray
-    torsion_angles: np.ndarray
     distogram_logits: np.ndarray
-    plddt: np.ndarray
-    pae: np.ndarray
-    pair: np.ndarray
-    quality: Dict[str, float]
-    self_consistency: float
-
-    def to_jsonable(self) -> Dict[str, object]:
-        return {
-            "sequence": self.sequence,
-            "state": self.state,
-            "coordinates": self.coordinates.tolist(),
-            "torsion_angles": self.torsion_angles.tolist(),
-            "torsion_logits_shape": list(self.torsion_logits.shape),
-            "distogram_logits_shape": list(self.distogram_logits.shape),
-            "plddt": self.plddt.tolist(),
-            "pae": self.pae.tolist(),
-            "pair_shape": list(self.pair.shape),
-            "quality": self.quality,
-            "self_consistency": self.self_consistency,
-        }
+    confidence: np.ndarray
 
 
-class OmegaFoldUltra:
+class RealStructureDataset:
+    """Build training examples from local or downloaded PDB structures."""
+
+    def __init__(self, examples: List[StructureExample]):
+        self.examples = examples
+
+    @staticmethod
+    def _extract_from_structure(structure, pdb_id: str, min_len: int = 20, max_len: int = 400) -> Optional[StructureExample]:
+        for model in structure:
+            for chain in model:
+                seq = []
+                coords = []
+                for residue in chain:
+                    if not is_aa(residue, standard=True):
+                        continue
+                    res3 = residue.get_resname().upper()
+                    aa = RES3_TO_1.get(res3, "X")
+                    if "CA" not in residue:
+                        continue
+                    seq.append(aa)
+                    coords.append(np.asarray(residue["CA"].get_coord(), dtype=np.float64))
+                if min_len <= len(seq) <= max_len:
+                    return StructureExample(pdb_id=pdb_id, sequence="".join(seq), coords=np.stack(coords, axis=0))
+        return None
+
+    @classmethod
+    def from_local_pdbs(cls, pdb_paths: Sequence[str], min_len: int = 20, max_len: int = 400) -> "RealStructureDataset":
+        parser = PDBParser(QUIET=True)
+        examples: List[StructureExample] = []
+        for p in pdb_paths:
+            path = Path(p)
+            structure = parser.get_structure(path.stem, str(path))
+            ex = cls._extract_from_structure(structure, path.stem, min_len=min_len, max_len=max_len)
+            if ex is not None:
+                examples.append(ex)
+        return cls(examples)
+
+    @classmethod
+    def from_rcsb_ids(cls, pdb_ids: Sequence[str], cache_dir: str = "pdb_cache", min_len: int = 20, max_len: int = 400) -> "RealStructureDataset":
+        os.makedirs(cache_dir, exist_ok=True)
+        pdbl = PDBList(verbose=False)
+        parser = PDBParser(QUIET=True)
+        examples: List[StructureExample] = []
+
+        for pid in pdb_ids:
+            pid = pid.lower()
+            try:
+                local_file = pdbl.retrieve_pdb_file(pid, pdir=cache_dir, file_format="pdb", overwrite=False)
+                structure = parser.get_structure(pid, local_file)
+                ex = cls._extract_from_structure(structure, pid, min_len=min_len, max_len=max_len)
+                if ex is not None:
+                    examples.append(ex)
+            except Exception:
+                continue
+
+        return cls(examples)
+
+
+class TrainableProteinModel:
+    """Autograd-trained baseline for coordinate regression + geometric heads."""
+
     def __init__(self, config: Optional[ModelConfig] = None):
         self.config = config or ModelConfig()
         self.rng = np.random.default_rng(self.config.random_seed)
-        self.W = self._init_weights()
+        self.params = self._init_params()
 
-    def _init_weights(self) -> Dict[str, np.ndarray]:
-        c = self.config
+    def _init_params(self) -> Dict[str, np.ndarray]:
+        d_in = len(AA_VOCAB) + 6  # one-hot + biochemical
+        h = self.config.d_hidden
+        t = self.config.torsion_bins * 3
+        db = self.config.dist_bins
 
-        def n(*shape: int, scale: float = 0.03) -> np.ndarray:
+        def n(*shape, scale=0.05):
             return self.rng.normal(0.0, scale, size=shape)
 
         return {
-            "seq_embed": n(len(AA_VOCAB), c.d_seq),
-            "pos_embed": n(8192, c.d_seq),
-            "state_embed": n(len(c.allosteric_states), c.d_seq, scale=0.02),
-            "bio_embed": n(6, c.d_seq),
-            "msa_embed": n(len(AA_VOCAB), c.d_msa),
-            "msa_row_mix": n(c.d_msa, c.d_msa),
-            "msa_col_mix": n(c.d_msa, c.d_msa),
-            "msa_to_pair_l": n(c.d_msa, c.d_pair),
-            "msa_to_pair_r": n(c.d_msa, c.d_pair),
-            "seq_to_pair_l": n(c.d_seq, c.d_pair),
-            "seq_to_pair_r": n(c.d_seq, c.d_pair),
-            "pair_bias_proj": n(8, c.d_pair),
-            "tri_mul_out": n(c.d_pair, c.d_pair),
-            "tri_mul_in": n(c.d_pair, c.d_pair),
-            "tri_q": n(c.d_pair, c.d_pair),
-            "tri_k": n(c.d_pair, c.d_pair),
-            "tri_v": n(c.d_pair, c.d_pair),
-            "ipa_pair_to_force": n(c.d_pair, 3),
-            "ipa_pair_gate": n(c.d_pair, 1),
-            "diffusion_cond": n(c.d_pair, 3),
-            "torsion_head": n(c.d_seq + c.d_pair, c.torsion_bins * 3),
-            "dist_head": n(c.d_pair, c.dist_bins),
-            "plddt_head": n(c.d_seq + c.d_pair, 1),
-            "pae_head": n(c.d_pair, 1),
-            "rank_head": n(8, 1),
+            "W1": n(d_in, h),
+            "b1": np.zeros(h),
+            "W2": n(h, h),
+            "b2": np.zeros(h),
+            "W_coord": n(h, 3),
+            "b_coord": np.zeros(3),
+            "W_tors": n(h, t),
+            "b_tors": np.zeros(t),
+            "W_conf": n(h, 1),
+            "b_conf": np.zeros(1),
+            "W_pair": n(h, db),
+            "b_pair": np.zeros(db),
         }
-
-    @staticmethod
-    def _idx(seq: str) -> np.ndarray:
-        return np.asarray([AA_TO_IDX.get(s, AA_TO_IDX["X"]) for s in seq], dtype=np.int64)
-
-    @staticmethod
-    def _softmax(x: np.ndarray, axis: int = -1) -> np.ndarray:
-        x = x - x.max(axis=axis, keepdims=True)
-        e = np.exp(x)
-        return e / np.clip(e.sum(axis=axis, keepdims=True), 1e-9, None)
 
     @staticmethod
     def _bio_features(sequence: str) -> np.ndarray:
@@ -148,409 +160,167 @@ class OmegaFoldUltra:
         out = []
         for aa in sequence:
             out.append([
-                aa in hydrophobic,
-                aa in positive,
-                aa in negative,
-                aa in aromatic,
-                aa in special,
-                aa in small,
+                1.0 if aa in hydrophobic else 0.0,
+                1.0 if aa in positive else 0.0,
+                1.0 if aa in negative else 0.0,
+                1.0 if aa in aromatic else 0.0,
+                1.0 if aa in special else 0.0,
+                1.0 if aa in small else 0.0,
             ])
         return np.asarray(out, dtype=np.float64)
 
-    def sequence_embedding(self, sequence: str, state: str) -> np.ndarray:
-        idx = self._idx(sequence)
-        if len(sequence) > self.W["pos_embed"].shape[0]:
-            raise ValueError("Sequence too long for positional table")
-
-        seq = self.W["seq_embed"][idx] + self.W["pos_embed"][np.arange(len(sequence))]
-        state_idx = self.config.allosteric_states.index(state)
-        seq = seq + self.W["state_embed"][state_idx][None, :]
-        seq = seq + 0.25 * (self._bio_features(sequence) @ self.W["bio_embed"])
-        return seq
-
-    def msa_encoder(self, msa: Sequence[str]) -> Tuple[np.ndarray, np.ndarray]:
-        if not msa:
-            raise ValueError("MSA cannot be empty")
-        L = len(msa[0])
-        if any(len(r) != L for r in msa):
-            raise ValueError("MSA rows must have same length")
-
-        idx = np.stack([self._idx(r) for r in msa], axis=0)
-        m = self.W["msa_embed"][idx]
-
-        if self.config.msa_dropout > 0:
-            keep = self.rng.random(m.shape[:2]) > self.config.msa_dropout
-            m = m * keep[..., None]
-
-        row = np.tanh(m @ self.W["msa_row_mix"])
-        col = np.transpose(np.transpose(m, (1, 0, 2)) @ self.W["msa_col_mix"], (1, 0, 2))
-        fused = 0.5 * m + 0.25 * row + 0.25 * np.tanh(col)
-
-        msa_repr = fused.mean(axis=0)
-        coupling = np.tanh((msa_repr @ msa_repr.T) / max(1, msa_repr.shape[-1]))
-        return msa_repr, coupling
+    @staticmethod
+    def _encode(sequence: str) -> np.ndarray:
+        oh = np.zeros((len(sequence), len(AA_VOCAB)), dtype=np.float64)
+        for i, a in enumerate(sequence):
+            oh[i, AA_TO_IDX.get(a, AA_TO_IDX["X"])] = 1.0
+        bio = TrainableProteinModel._bio_features(sequence)
+        return np.concatenate([oh, bio], axis=-1)
 
     @staticmethod
-    def _template_prior(L: int) -> np.ndarray:
-        i = np.arange(L)[:, None]
-        j = np.arange(L)[None, :]
-        sep = np.abs(i - j)
-        helix = np.exp(-((sep - 4.0) ** 2) / 14.0)
-        sheet = np.exp(-((sep - 8.0) ** 2) / 18.0)
-        long_range = np.exp(-((sep - 14.0) ** 2) / 64.0)
-        return 0.45 * helix + 0.35 * sheet + 0.20 * long_range
+    def _softmax(x: anp.ndarray, axis: int = -1) -> anp.ndarray:
+        x = x - anp.max(x, axis=axis, keepdims=True)
+        e = anp.exp(x)
+        return e / anp.clip(anp.sum(e, axis=axis, keepdims=True), 1e-9, None)
 
-    def pair_representation(self, seq_repr: np.ndarray, msa_repr: np.ndarray, coupling: np.ndarray) -> np.ndarray:
-        L = seq_repr.shape[0]
-        z = (
-            (seq_repr @ self.W["seq_to_pair_l"])[:, None, :]
-            + (seq_repr @ self.W["seq_to_pair_r"])[None, :, :]
-            + (msa_repr @ self.W["msa_to_pair_l"])[:, None, :]
-            + (msa_repr @ self.W["msa_to_pair_r"])[None, :, :]
-        )
+    def _forward_autograd(self, params: Dict[str, anp.ndarray], x: anp.ndarray) -> Tuple[anp.ndarray, anp.ndarray, anp.ndarray, anp.ndarray]:
+        h1 = anp.tanh(anp.dot(x, params["W1"]) + params["b1"])
+        h2 = anp.tanh(anp.dot(h1, params["W2"]) + params["b2"])
 
-        ii = np.arange(L)[:, None]
-        jj = np.arange(L)[None, :]
-        sep = np.abs(ii - jj)
-        rel = np.tanh((ii - jj) / 24.0)
-        log_sep = np.log1p(sep)
-        inv_sep = 1.0 / (1.0 + sep)
-        template = self._template_prior(L)
-        contact_prior = np.exp(-sep / 12.0)
-        band_prior = (sep <= 4).astype(float)
-        anti_band = (sep >= 12).astype(float)
+        coords = anp.dot(h2, params["W_coord"]) + params["b_coord"]
+        coords = coords - anp.mean(coords, axis=0, keepdims=True)
 
-        bias = np.stack(
-            [
-                rel,
-                log_sep / (log_sep.max() + 1e-6),
-                inv_sep,
-                template,
-                coupling,
-                contact_prior,
-                band_prior,
-                anti_band,
-            ],
-            axis=-1,
-        )
-        z = z + bias @ self.W["pair_bias_proj"]
-        z = 0.5 * (z + np.transpose(z, (1, 0, 2)))
-        return z
+        tors = anp.dot(h2, params["W_tors"]) + params["b_tors"]
+        tors = tors.reshape((x.shape[0], 3, self.config.torsion_bins))
 
-    def _triangle_mul(self, z: np.ndarray, outgoing: bool) -> np.ndarray:
-        w = self.W["tri_mul_out"] if outgoing else self.W["tri_mul_in"]
-        h = np.tanh(z @ w)
-        if outgoing:
-            return np.einsum("ikd,jkd->ijd", h, h) / math.sqrt(z.shape[-1])
-        return np.einsum("kid,kjd->ijd", h, h) / math.sqrt(z.shape[-1])
+        conf = 100.0 / (1.0 + anp.exp(-(anp.dot(h2, params["W_conf"]) + params["b_conf"]))).reshape((x.shape[0],))
 
-    def _triangle_attn(self, z: np.ndarray) -> np.ndarray:
-        q = z @ self.W["tri_q"]
-        k = z @ self.W["tri_k"]
-        v = z @ self.W["tri_v"]
-        logits = np.einsum("ijd,ikd->ijk", q, k) / math.sqrt(z.shape[-1])
-        a = self._softmax(logits, axis=-1)
-        return np.einsum("ijk,ikd->ijd", a, v)
+        pair_f = h2[:, None, :] + h2[None, :, :]
+        dist_logits = anp.einsum("ijd,db->ijb", pair_f, params["W_pair"]) + params["b_pair"]
+        return coords, tors, dist_logits, conf
 
-    def evoformer_recycle(self, pair: np.ndarray) -> np.ndarray:
-        z = pair.copy()
-        for _ in range(self.config.n_evo_blocks):
-            for _ in range(self.config.n_triangle_updates):
-                z_new = z + 0.22 * np.tanh(self._triangle_mul(z, True))
-                z_new = z_new + 0.22 * np.tanh(self._triangle_mul(z_new, False))
-                z_new = z_new + 0.18 * np.tanh(self._triangle_attn(z_new))
-                z_new = 0.5 * (z_new + np.transpose(z_new, (1, 0, 2)))
-                delta = float(np.mean((z_new - z) ** 2))
-                z = z_new
-                if delta < self.config.recycle_tol:
-                    break
-        return z
+    def _example_loss(self, params: Dict[str, anp.ndarray], ex: StructureExample) -> anp.ndarray:
+        x = anp.asarray(self._encode(ex.sequence))
+        y = anp.asarray(ex.coords)
 
-    def _ipa_refine(self, pair: np.ndarray, steps: int) -> np.ndarray:
-        L = pair.shape[0]
-        coords = np.stack([np.arange(L), np.zeros(L), np.zeros(L)], axis=-1).astype(np.float64)
-        for _ in range(steps):
-            rel = coords[:, None, :] - coords[None, :, :]
-            d2 = np.sum(rel * rel, axis=-1, keepdims=True) + 1e-6
-            unit = rel / np.sqrt(d2)
-            gate = 1.0 / (1.0 + np.exp(-(pair @ self.W["ipa_pair_gate"])))
-            force_feat = np.tanh(pair @ self.W["ipa_pair_to_force"])
-            force = gate * (0.22 * unit + 0.04 * force_feat) / np.sqrt(d2)
+        pred_coords, tors, dist_logits, conf = self._forward_autograd(params, x)
 
-            smooth = np.zeros_like(coords)
-            smooth[1:-1] = 0.5 * (coords[:-2] + coords[2:]) - coords[1:-1]
-            delta = (force.sum(axis=1) - force.sum(axis=0)) + 0.08 * smooth
-            coords += 0.03 * delta
-            coords -= coords.mean(axis=0, keepdims=True)
-        return coords
+        # coordinate loss
+        coord_loss = anp.mean((pred_coords - (y - anp.mean(y, axis=0, keepdims=True))) ** 2)
 
-    def _diffusion_refine(self, coords: np.ndarray, pair: np.ndarray, steps: int) -> np.ndarray:
-        x = coords.copy()
-        cond = np.tanh(pair @ self.W["diffusion_cond"]).mean(axis=1)
-        for t in range(steps, 0, -1):
-            sigma = 0.08 * (t / max(1, steps))
-            noise = self.rng.normal(0.0, sigma, size=x.shape)
-            xn = x + noise
-            smooth = np.zeros_like(x)
-            smooth[1:-1] = 0.5 * (xn[:-2] + xn[2:]) - xn[1:-1]
-            x = xn + 0.22 * (0.58 * smooth + 0.42 * cond)
-            x -= x.mean(axis=0, keepdims=True)
-        return x
+        # smooth backbone prior
+        b = pred_coords[1:] - pred_coords[:-1]
+        bond_len = anp.sqrt(anp.sum(b * b, axis=-1) + 1e-8)
+        bond_loss = anp.mean((bond_len - 3.8) ** 2)
 
-    def _anneal_relax(self, coords: np.ndarray) -> np.ndarray:
-        x = coords.copy()
-        T = self.config.anneal_temp0
+        # distogram supervision from true distances
+        d_true = anp.sqrt(anp.sum((y[:, None, :] - y[None, :, :]) ** 2, axis=-1) + 1e-8)
+        d_bin = anp.clip(anp.floor(d_true / 1.5), 0, self.config.dist_bins - 1).astype(int)
+        probs = self._softmax(dist_logits, axis=-1)
+        idx_i = anp.arange(y.shape[0])[:, None]
+        idx_j = anp.arange(y.shape[0])[None, :]
+        picked = probs[idx_i, idx_j, d_bin]
+        dist_loss = -anp.mean(anp.log(anp.clip(picked, 1e-9, 1.0)))
 
-        def energy(c: np.ndarray) -> float:
-            b = np.linalg.norm(c[1:] - c[:-1], axis=-1)
-            bond = np.mean((b - 3.8) ** 2)
-            rg = np.sqrt(np.mean(np.sum((c - c.mean(axis=0)) ** 2, axis=-1)))
-            rel = c[:, None, :] - c[None, :, :]
-            d = np.sqrt(np.sum(rel * rel, axis=-1) + 1e-8)
-            clash = np.mean((d < 1.2) & (~np.eye(len(c), dtype=bool)))
-            return float(2.5 * bond + 0.6 / (rg + 1e-6) + 8.0 * clash)
+        # confidence regularization
+        conf_loss = anp.mean((conf - 70.0) ** 2) / 1000.0
 
-        e = energy(x)
-        for step in range(self.config.anneal_steps):
-            i = self.rng.integers(0, len(x))
-            proposal = x.copy()
-            proposal[i] += self.rng.normal(0.0, 0.2, size=3)
-            proposal -= proposal.mean(axis=0, keepdims=True)
-            en = energy(proposal)
-            de = en - e
-            if de <= 0 or self.rng.random() < math.exp(-de / max(1e-6, T)):
-                x, e = proposal, en
-            T = self.config.anneal_temp0 * (1 - (step + 1) / self.config.anneal_steps)
-        return x
+        return coord_loss + 0.1 * bond_loss + 0.2 * dist_loss + 0.05 * conf_loss + 0.001 * anp.mean(tors ** 2)
 
-    def torsion_head(self, seq_repr: np.ndarray, pair: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        pooled = pair.mean(axis=1)
-        f = np.concatenate([seq_repr, pooled], axis=-1)
-        logits = (f @ self.W["torsion_head"]).reshape(len(seq_repr), 3, self.config.torsion_bins)
-        probs = self._softmax(logits, axis=-1)
-        idx = probs.argmax(axis=-1)
-        angles = -math.pi + (2 * math.pi) * idx / max(1, self.config.torsion_bins - 1)
-        return logits, angles
+    def _batch_loss(self, params: Dict[str, anp.ndarray], batch: Sequence[StructureExample]) -> anp.ndarray:
+        losses = [self._example_loss(params, ex) for ex in batch]
+        return anp.mean(anp.stack(losses))
 
-    def distogram_head(self, pair: np.ndarray) -> np.ndarray:
-        return np.einsum("ijd,db->ijb", pair, self.W["dist_head"])
+    def train(self, dataset: RealStructureDataset) -> List[float]:
+        if not dataset.examples:
+            raise ValueError("Dataset is empty. Provide valid PDB structures.")
 
-    def plddt_head(self, seq_repr: np.ndarray, pair: np.ndarray) -> np.ndarray:
-        pooled = pair.mean(axis=1)
-        f = np.concatenate([seq_repr, pooled], axis=-1)
-        logits = (f @ self.W["plddt_head"]).squeeze(-1)
-        return 100.0 / (1.0 + np.exp(-logits))
+        loss_grad = grad(self._batch_loss)
+        history: List[float] = []
 
-    def pae_head(self, pair: np.ndarray) -> np.ndarray:
-        logits = (pair @ self.W["pae_head"]).squeeze(-1)
-        p = 30.0 / (1.0 + np.exp(-logits))
-        return 0.5 * (p + p.T)
+        for epoch in range(self.config.epochs):
+            self.rng.shuffle(dataset.examples)
+            batches = [
+                dataset.examples[i: i + self.config.batch_size]
+                for i in range(0, len(dataset.examples), self.config.batch_size)
+            ]
 
-    @staticmethod
-    def _physical_quality(coords: np.ndarray) -> Dict[str, float]:
-        rel = coords[:, None, :] - coords[None, :, :]
-        d = np.sqrt(np.sum(rel * rel, axis=-1) + 1e-8)
-        L = len(coords)
-        clash = float(((d < 1.1) & (~np.eye(L, dtype=bool))).sum()) / max(1, L * L)
-        bond = np.linalg.norm(coords[1:] - coords[:-1], axis=-1)
-        bond_dev = float(np.mean((bond - 3.8) ** 2))
-        rg = float(np.sqrt(np.mean(np.sum((coords - coords.mean(axis=0)) ** 2, axis=-1))))
-        compact = 1.0 / (1.0 + rg)
-        return {
-            "clash_fraction": clash,
-            "bond_deviation": bond_dev,
-            "radius_of_gyration": rg,
-            "compactness": compact,
-        }
+            epoch_losses = []
+            for batch in batches:
+                g = loss_grad(self.params, batch)
+                for k in self.params:
+                    self.params[k] = self.params[k] - self.config.lr * np.asarray(g[k])
+                epoch_losses.append(float(self._batch_loss(self.params, batch)))
 
-    @staticmethod
-    def _self_consistency(pair: np.ndarray, dist_logits: np.ndarray) -> float:
-        # compare implied short-distance probability with pair norm signal
-        probs = np.exp(dist_logits - dist_logits.max(axis=-1, keepdims=True))
-        probs = probs / np.clip(probs.sum(axis=-1, keepdims=True), 1e-9, None)
-        short_prob = probs[..., :8].mean(axis=-1)
-        pair_signal = np.tanh(np.linalg.norm(pair, axis=-1) / max(1e-6, pair.shape[-1]))
-        return float(1.0 - np.mean(np.abs(short_prob - pair_signal)))
+            history.append(float(np.mean(epoch_losses)))
+        return history
 
-    def _calibrate_uncertainty(self, plddt: np.ndarray, pae: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        plddt_cal = np.clip(0.85 * plddt + 0.15 * (100 - pae.mean(axis=-1)), 0, 100)
-        pae_cal = np.clip(0.85 * pae + 0.15 * (30 - np.minimum(30, plddt[:, None] / 3.0)), 0, 30)
-        pae_cal = 0.5 * (pae_cal + pae_cal.T)
-        return plddt_cal, pae_cal
-
-    def _rank_score(self, pred: Prediction, diversity: float) -> float:
-        q = pred.quality
-        feats = np.asarray(
-            [
-                float(pred.plddt.mean()) / 100.0,
-                1.0 / (1.0 + float(pred.pae.mean()) / 30.0),
-                1.0 - q["clash_fraction"],
-                1.0 / (1.0 + q["bond_deviation"]),
-                q["compactness"],
-                pred.self_consistency,
-                1.0 / (1.0 + diversity),
-                1.0 / (1.0 + q["radius_of_gyration"]),
-            ],
-            dtype=np.float64,
-        )
-        return float((feats @ self.W["rank_head"]).squeeze())
-
-    def _single(self, sequence: str, msa: Sequence[str], state: str) -> Prediction:
-        seq_repr = self.sequence_embedding(sequence, state)
-        msa_repr, coupling = self.msa_encoder(msa)
-        pair = self.pair_representation(seq_repr, msa_repr, coupling)
-
-        for _ in range(self.config.n_recycles):
-            updated = self.evoformer_recycle(pair)
-            delta = float(np.mean((updated - pair) ** 2))
-            pair = updated
-            if delta < self.config.recycle_tol:
-                break
-
-        coords = self._ipa_refine(pair, self.config.n_refine_steps)
-        coords = self._diffusion_refine(coords, pair, self.config.n_diffusion_steps)
-        coords = self._anneal_relax(coords)
-
-        torsion_logits, torsion_angles = self.torsion_head(seq_repr, pair)
-        dist_logits = self.distogram_head(pair)
-        plddt = self.plddt_head(seq_repr, pair)
-        pae = self.pae_head(pair)
-        plddt, pae = self._calibrate_uncertainty(plddt, pae)
-
-        quality = self._physical_quality(coords)
-        consistency = self._self_consistency(pair, dist_logits)
-
+    def predict(self, sequence: str) -> Prediction:
+        x = self._encode(sequence)
+        coords, tors, dist, conf = self._forward_autograd(self.params, anp.asarray(x))
         return Prediction(
             sequence=sequence,
-            state=state,
-            coordinates=coords,
-            torsion_logits=torsion_logits,
-            torsion_angles=torsion_angles,
-            distogram_logits=dist_logits,
-            plddt=plddt,
-            pae=pae,
-            pair=pair,
-            quality=quality,
-            self_consistency=consistency,
+            coords=np.asarray(coords),
+            torsion_logits=np.asarray(tors),
+            distogram_logits=np.asarray(dist),
+            confidence=np.asarray(conf),
         )
-
-    def ensemble_sample(self, sequence: str, msa: Sequence[str], state: str) -> Dict[str, object]:
-        members: List[Prediction] = []
-        seed0 = self.config.random_seed or 0
-
-        for i in range(self.config.n_ensemble):
-            self.rng = np.random.default_rng(seed0 + 100003 * (i + 1))
-            self.W = self._init_weights()
-            members.append(self._single(sequence, msa, state))
-
-        coords = np.stack([m.coordinates for m in members], axis=0)
-        plddt = np.stack([m.plddt for m in members], axis=0)
-        pae = np.stack([m.pae for m in members], axis=0)
-
-        flat = coords.reshape(coords.shape[0], -1)
-        center = np.median(flat, axis=0)
-        dist_center = np.linalg.norm(flat - center[None, :], axis=1)
-        diversity = float(coords.var(axis=0).mean())
-
-        ranked = []
-        for i, m in enumerate(members):
-            ranked.append((self._rank_score(m, diversity), i))
-        ranked.sort(reverse=True)
-
-        return {
-            "state": state,
-            "members": members,
-            "ranked_indices": [i for _, i in ranked],
-            "best_member_index": ranked[0][1],
-            "mean_coordinates": coords.mean(axis=0),
-            "coordinate_variance": coords.var(axis=0),
-            "mean_plddt": plddt.mean(axis=0),
-            "mean_pae": pae.mean(axis=0),
-            "mean_self_consistency": float(np.mean([m.self_consistency for m in members])),
-            "ensemble_diversity": diversity,
-            "distance_to_center": dist_center.tolist(),
-        }
-
-    def allosteric_landscape(self, sequence: str, msa: Sequence[str]) -> Dict[str, Dict[str, object]]:
-        out = {}
-        for state in self.config.allosteric_states:
-            out[state] = self.ensemble_sample(sequence, msa, state)
-        return out
 
 
 def _parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="OmegaFold-Ultra prototype")
-    p.add_argument("sequence")
-    p.add_argument("--msa", nargs="*", default=None)
-    p.add_argument("--state", default="inactive")
-    p.add_argument("--ensemble", type=int, default=10)
-    p.add_argument("--recycles", type=int, default=5)
-    p.add_argument("--evo-blocks", type=int, default=7)
+    p = argparse.ArgumentParser(description="Trainable protein prototype with real PDB ingestion")
+    p.add_argument("sequence", nargs="?", help="Sequence for inference")
+    p.add_argument("--train-pdb-ids", nargs="*", default=None, help="RCSB PDB IDs for training")
+    p.add_argument("--train-pdb-files", nargs="*", default=None, help="Local PDB files for training")
+    p.add_argument("--epochs", type=int, default=10)
+    p.add_argument("--batch-size", type=int, default=2)
+    p.add_argument("--lr", type=float, default=1e-2)
     p.add_argument("--json", action="store_true")
     return p
 
 
 def main() -> None:
     args = _parser().parse_args()
-    cfg = ModelConfig(n_ensemble=args.ensemble, n_recycles=args.recycles, n_evo_blocks=args.evo_blocks)
-    model = OmegaFoldUltra(cfg)
-    msa = args.msa if args.msa else [args.sequence]
+    cfg = ModelConfig(epochs=args.epochs, batch_size=args.batch_size, lr=args.lr)
+    model = TrainableProteinModel(cfg)
 
-    if args.state == "all":
-        landscape = model.allosteric_landscape(args.sequence, msa)
-        summary = {
-            s: {
-                "mean_plddt": float(v["mean_plddt"].mean()),
-                "mean_pae": float(v["mean_pae"].mean()),
-                "mean_self_consistency": float(v["mean_self_consistency"]),
-                "diversity": float(v["ensemble_diversity"]),
-                "best_member_index": int(v["best_member_index"]),
-                "shape": list(v["mean_coordinates"].shape),
-            }
-            for s, v in landscape.items()
+    trained = False
+    history = []
+
+    if args.train_pdb_files:
+        ds = RealStructureDataset.from_local_pdbs(args.train_pdb_files, min_len=5)
+        if ds.examples:
+            history = model.train(ds)
+            trained = True
+
+    if args.train_pdb_ids:
+        ds = RealStructureDataset.from_rcsb_ids(args.train_pdb_ids, min_len=5)
+        if ds.examples:
+            history = model.train(ds)
+            trained = True
+
+    if args.sequence:
+        pred = model.predict(args.sequence)
+        out = {
+            "sequence": pred.sequence,
+            "trained": trained,
+            "train_loss_history": history,
+            "coords": pred.coords.tolist(),
+            "torsion_logits_shape": list(pred.torsion_logits.shape),
+            "distogram_logits_shape": list(pred.distogram_logits.shape),
+            "confidence": pred.confidence.tolist(),
         }
         if args.json:
-            print(json.dumps(summary, indent=2))
+            print(json.dumps(out, indent=2))
         else:
-            for s, d in summary.items():
-                print(
-                    f"State={s:18s} pLDDT={d['mean_plddt']:.2f} PAE={d['mean_pae']:.2f} "
-                    f"SC={d['mean_self_consistency']:.3f} div={d['diversity']:.6f}"
-                )
-        return
-
-    if args.state not in cfg.allosteric_states:
-        raise ValueError(f"state must be in {cfg.allosteric_states} or 'all'")
-
-    out = model.ensemble_sample(args.sequence, msa, args.state)
-    payload = {
-        "state": out["state"],
-        "ranked_indices": out["ranked_indices"],
-        "best_member_index": out["best_member_index"],
-        "mean_coordinates": out["mean_coordinates"].tolist(),
-        "coordinate_variance": out["coordinate_variance"].tolist(),
-        "mean_plddt": out["mean_plddt"].tolist(),
-        "mean_pae": out["mean_pae"].tolist(),
-        "mean_self_consistency": out["mean_self_consistency"],
-        "ensemble_diversity": out["ensemble_diversity"],
-        "distance_to_center": out["distance_to_center"],
-        "members": [m.to_jsonable() for m in out["members"]],
-    }
-
-    if args.json:
-        print(json.dumps(payload, indent=2))
-    else:
-        print(f"State: {payload['state']}")
-        print(f"Length: {len(args.sequence)}")
-        print(f"Ensemble: {len(payload['members'])}")
-        print(f"Best member index: {payload['best_member_index']}")
-        print(f"Mean pLDDT: {float(np.mean(out['mean_plddt'])):.2f}")
-        print(f"Mean PAE: {float(np.mean(out['mean_pae'])):.2f}")
-        print(f"Mean self-consistency: {payload['mean_self_consistency']:.3f}")
-        print(f"Ensemble diversity: {payload['ensemble_diversity']:.6f}")
-        print("First 5 residues (mean coordinates):")
-        for i, c in enumerate(payload["mean_coordinates"][:5]):
-            print(f"  {i:3d}: ({c[0]: .3f}, {c[1]: .3f}, {c[2]: .3f})")
+            print(f"Sequence length: {len(pred.sequence)}")
+            print(f"Trained: {trained}")
+            if history:
+                print(f"Final train loss: {history[-1]:.4f}")
+            print(f"Mean confidence: {float(np.mean(pred.confidence)):.2f}")
+            print("First 5 C-alpha coordinates:")
+            for i, c in enumerate(pred.coords[:5]):
+                print(f"  {i:3d}: ({c[0]: .3f}, {c[1]: .3f}, {c[2]: .3f})")
 
 
 if __name__ == "__main__":
