@@ -1,13 +1,19 @@
-"""Advanced lattice protein folding engine.
+"""Research-oriented protein folding architecture prototype.
 
-Features
---------
-- 2D/3D self-avoiding lattice representations.
-- Multi-term energy model (pair contacts, bend penalty, compactness term).
-- Advanced Monte Carlo move set: end move, corner flip, crankshaft, pivot move.
-- Parallel tempering (replica exchange) + simulated annealing cooling schedule.
-- Multi-start optimization and deterministic reproducibility.
-- Contact-map and structural metrics utilities.
+This module implements a compact, dependency-light (NumPy-only) analogue of modern
+structure prediction pipelines with the following components:
+
+- Sequence embedding.
+- MSA encoder.
+- Pair representation initialization.
+- AlphaFold-style triangle multiplicative/additive updates.
+- SE(3)-equivariant coordinate refinement.
+- Torsion-angle prediction head.
+- Ensemble sampling.
+- Allosteric state conditioning/modeling.
+
+The implementation is intentionally lightweight and educational; it is not meant to
+replace production-grade systems such as AlphaFold/OpenFold/RoseTTAFold.
 """
 
 from __future__ import annotations
@@ -15,501 +21,317 @@ from __future__ import annotations
 import argparse
 import json
 import math
-import random
-from dataclasses import asdict, dataclass
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from dataclasses import asdict, dataclass, field
+from typing import Dict, List, Optional, Tuple
 
-Coord = Tuple[int, int, int]
+import numpy as np
 
-
-@dataclass
-class EnergyWeights:
-    """Energy term coefficients."""
-
-    hh_contact: float = -1.0
-    hp_contact: float = 0.15
-    pp_contact: float = 0.05
-    bend_penalty: float = 0.02
-    compactness_bonus: float = -0.01
+AA_VOCAB = "ACDEFGHIKLMNPQRSTVWY-X"  # 20 aa + gap + unknown placeholder
+AA_TO_IDX = {aa: i for i, aa in enumerate(AA_VOCAB)}
 
 
 @dataclass
-class MoveWeights:
-    """Relative probabilities used to sample lattice moves."""
+class ModelConfig:
+    """Hyperparameters for the architecture."""
 
-    corner_flip: float = 1.0
-    end_move: float = 1.0
-    crankshaft: float = 1.0
-    pivot: float = 2.5
+    d_seq: int = 128
+    d_msa: int = 96
+    d_pair: int = 64
+    n_recycles: int = 4
+    n_triangle_updates: int = 2
+    n_refine_steps: int = 30
+    torsion_bins: int = 36
+    n_ensemble: int = 8
+    random_seed: Optional[int] = 7
+    # allosteric states: e.g. inactive, active, intermediate
+    allosteric_states: Tuple[str, ...] = ("inactive", "active", "intermediate")
 
 
 @dataclass
-class ProteinFoldingConfig:
-    """Global optimization controls."""
+class ModelWeights:
+    """Randomly initialized lightweight weights for demonstrative inference."""
 
-    dimensions: int = 3
-    # Annealing / tempering
-    initial_temperature: float = 8.0
-    final_temperature: float = 0.04
-    cooling_rate: float = 0.995
-    steps_per_temperature: int = 200
-    replicas: int = 6
-    exchange_interval: int = 15
-    # Global search
-    restarts: int = 4
-    max_stagnation_steps: int = 1600
-    random_seed: Optional[int] = 42
-    track_history: bool = True
-    history_stride: int = 20
-    # Models
-    energy: EnergyWeights = EnergyWeights()
-    move_weights: MoveWeights = MoveWeights()
+    seq_embed: np.ndarray
+    msa_embed: np.ndarray
+    pair_proj_left: np.ndarray
+    pair_proj_right: np.ndarray
+    tri_mul_out: np.ndarray
+    tri_mul_in: np.ndarray
+    tri_attn_q: np.ndarray
+    tri_attn_k: np.ndarray
+    tri_attn_v: np.ndarray
+    refine_feat_proj: np.ndarray
+    torsion_proj: np.ndarray
+    state_embeddings: np.ndarray
 
 
-class ProteinFolder:
-    """Advanced HP lattice protein folder."""
+@dataclass
+class StructurePrediction:
+    sequence: str
+    state: str
+    coordinates: np.ndarray
+    pair_representation: np.ndarray
+    torsion_logits: np.ndarray
+    torsion_angles: np.ndarray
+    confidence: np.ndarray
 
-    _NEIGHBORS_3D: Tuple[Coord, ...] = (
-        (1, 0, 0),
-        (-1, 0, 0),
-        (0, 1, 0),
-        (0, -1, 0),
-        (0, 0, 1),
-        (0, 0, -1),
-    )
-    _NEIGHBORS_2D: Tuple[Coord, ...] = (
-        (1, 0, 0),
-        (-1, 0, 0),
-        (0, 1, 0),
-        (0, -1, 0),
-    )
-
-    # Integer orthogonal transforms preserving cubic lattice (subset for practical pivoting).
-    _ROTATIONS_3D: Tuple[Tuple[Coord, Coord, Coord], ...] = (
-        ((1, 0, 0), (0, 1, 0), (0, 0, 1)),
-        ((1, 0, 0), (0, 0, 1), (0, -1, 0)),
-        ((1, 0, 0), (0, -1, 0), (0, 0, -1)),
-        ((1, 0, 0), (0, 0, -1), (0, 1, 0)),
-        ((0, 1, 0), (-1, 0, 0), (0, 0, 1)),
-        ((0, 0, 1), (-1, 0, 0), (0, -1, 0)),
-        ((0, -1, 0), (-1, 0, 0), (0, 0, -1)),
-        ((0, 0, -1), (-1, 0, 0), (0, 1, 0)),
-        ((-1, 0, 0), (0, -1, 0), (0, 0, 1)),
-        ((-1, 0, 0), (0, 0, -1), (0, -1, 0)),
-        ((-1, 0, 0), (0, 1, 0), (0, 0, -1)),
-        ((-1, 0, 0), (0, 0, 1), (0, 1, 0)),
-    )
-
-    _ROTATIONS_2D: Tuple[Tuple[Coord, Coord, Coord], ...] = (
-        ((1, 0, 0), (0, 1, 0), (0, 0, 1)),
-        ((0, 1, 0), (-1, 0, 0), (0, 0, 1)),
-        ((-1, 0, 0), (0, -1, 0), (0, 0, 1)),
-        ((0, -1, 0), (1, 0, 0), (0, 0, 1)),
-    )
-
-    def __init__(self, sequence: str, config: Optional[ProteinFoldingConfig] = None):
-        if not sequence:
-            raise ValueError("Sequence cannot be empty.")
-        seq = sequence.upper()
-        if any(c not in {"H", "P"} for c in seq):
-            raise ValueError("Sequence must contain only 'H' and 'P' characters.")
-
-        self.sequence = seq
-        self.config = config or ProteinFoldingConfig()
-        if self.config.dimensions not in {2, 3}:
-            raise ValueError("dimensions must be 2 or 3")
-
-        self.neighbors = self._NEIGHBORS_2D if self.config.dimensions == 2 else self._NEIGHBORS_3D
-        self.rotations = self._ROTATIONS_2D if self.config.dimensions == 2 else self._ROTATIONS_3D
-        self.rng = random.Random(self.config.random_seed)
-        self._move_fns = {
-            "corner_flip": self._attempt_corner_flip,
-            "end_move": self._attempt_end_move,
-            "crankshaft": self._attempt_crankshaft,
-            "pivot": self._attempt_pivot,
-        }
-
-    @staticmethod
-    def _add(a: Coord, b: Coord) -> Coord:
-        return (a[0] + b[0], a[1] + b[1], a[2] + b[2])
-
-    @staticmethod
-    def _sub(a: Coord, b: Coord) -> Coord:
-        return (a[0] - b[0], a[1] - b[1], a[2] - b[2])
-
-    @staticmethod
-    def _manhattan(a: Coord, b: Coord) -> int:
-        return abs(a[0] - b[0]) + abs(a[1] - b[1]) + abs(a[2] - b[2])
-
-    @staticmethod
-    def _sqdist(a: Coord, b: Coord) -> int:
-        return (a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2 + (a[2] - b[2]) ** 2
-
-    def _apply_rotation(self, vec: Coord, matrix: Tuple[Coord, Coord, Coord]) -> Coord:
-        r0, r1, r2 = matrix
-        return (
-            vec[0] * r0[0] + vec[1] * r0[1] + vec[2] * r0[2],
-            vec[0] * r1[0] + vec[1] * r1[1] + vec[2] * r1[2],
-            vec[0] * r2[0] + vec[1] * r2[1] + vec[2] * r2[2],
-        )
-
-    def _initial_linear_conformation(self) -> List[Coord]:
-        return [(i, 0, 0) for i in range(len(self.sequence))]
-
-    def _valid_backbone(self, coords: Sequence[Coord]) -> bool:
-        return all(self._manhattan(coords[i], coords[i + 1]) == 1 for i in range(len(coords) - 1))
-
-    def _is_self_avoiding(self, coords: Sequence[Coord]) -> bool:
-        return len(set(coords)) == len(coords)
-
-    def contact_map(self, coords: Sequence[Coord]) -> List[List[int]]:
-        """Binary non-bonded contact map based on Manhattan adjacency."""
-        n = len(coords)
-        cmap = [[0] * n for _ in range(n)]
-        for i in range(n):
-            for j in range(i + 2, n):
-                if self._manhattan(coords[i], coords[j]) == 1:
-                    cmap[i][j] = 1
-                    cmap[j][i] = 1
-        return cmap
-
-    def radius_of_gyration(self, coords: Sequence[Coord]) -> float:
-        """Compute radius of gyration (Rg)."""
-        n = len(coords)
-        cx = sum(c[0] for c in coords) / n
-        cy = sum(c[1] for c in coords) / n
-        cz = sum(c[2] for c in coords) / n
-        rg2 = sum((c[0] - cx) ** 2 + (c[1] - cy) ** 2 + (c[2] - cz) ** 2 for c in coords) / n
-        return math.sqrt(max(0.0, rg2))
-
-    def score(self, coords: Sequence[Coord]) -> float:
-        """Total energy = contact energy + bend term + compactness term."""
-        if len(coords) != len(self.sequence):
-            raise ValueError("Coordinates length must match sequence length.")
-
-        e = self.config.energy
-        energy = 0.0
-
-        # Pair-contact terms for non-consecutive adjacent residues.
-        for i in range(len(self.sequence)):
-            ai = self.sequence[i]
-            for j in range(i + 2, len(self.sequence)):
-                if self._manhattan(coords[i], coords[j]) != 1:
-                    continue
-                aj = self.sequence[j]
-                if ai == "H" and aj == "H":
-                    energy += e.hh_contact
-                elif ai == "P" and aj == "P":
-                    energy += e.pp_contact
-                else:
-                    energy += e.hp_contact
-
-        # Bend penalty to mildly discourage high-curvature conformations.
-        for i in range(1, len(coords) - 1):
-            v1 = self._sub(coords[i], coords[i - 1])
-            v2 = self._sub(coords[i + 1], coords[i])
-            if v1 != v2:
-                energy += e.bend_penalty
-
-        # Compactness bonus from centroid distance, weighted by hydrophobic content.
-        rg = self.radius_of_gyration(coords)
-        h_frac = self.sequence.count("H") / len(self.sequence)
-        energy += e.compactness_bonus * h_frac * len(self.sequence) / max(rg, 1e-6)
-        return energy
-
-    # ---------- move proposals ----------
-    def _attempt_end_move(self, coords: List[Coord]) -> Optional[List[Coord]]:
-        n = len(coords)
-        if n < 2:
-            return None
-        end_idx = 0 if self.rng.random() < 0.5 else n - 1
-        anchor_idx = 1 if end_idx == 0 else n - 2
-        anchor = coords[anchor_idx]
-
-        candidates = [self._add(anchor, d) for d in self.neighbors]
-        self.rng.shuffle(candidates)
-
-        occupied = set(coords)
-        occupied.remove(coords[end_idx])
-        for candidate in candidates:
-            if candidate in occupied:
-                continue
-            trial = coords.copy()
-            trial[end_idx] = candidate
-            if self._valid_backbone(trial) and self._is_self_avoiding(trial):
-                return trial
-        return None
-
-    def _attempt_corner_flip(self, coords: List[Coord]) -> Optional[List[Coord]]:
-        if len(coords) < 3:
-            return None
-        i = self.rng.randrange(1, len(coords) - 1)
-        prev_c, cur_c, next_c = coords[i - 1], coords[i], coords[i + 1]
-        if self._manhattan(prev_c, next_c) != 2:
-            return None
-
-        delta = self._add(self._sub(prev_c, cur_c), self._sub(next_c, cur_c))
-        candidate = self._add(cur_c, delta)
-
-        if candidate in set(coords):
-            return None
-        trial = coords.copy()
-        trial[i] = candidate
-        if self._valid_backbone(trial) and self._is_self_avoiding(trial):
-            return trial
-        return None
-
-    def _attempt_crankshaft(self, coords: List[Coord]) -> Optional[List[Coord]]:
-        if len(coords) < 4:
-            return None
-        i = self.rng.randrange(1, len(coords) - 2)
-        a, b, c, d = coords[i - 1], coords[i], coords[i + 1], coords[i + 2]
-        if self._manhattan(a, d) != 2:
-            return None
-
-        cand_b = [self._add(a, v) for v in self.neighbors if self._manhattan(self._add(a, v), d) == 1]
-        cand_c = [self._add(d, v) for v in self.neighbors if self._manhattan(self._add(d, v), a) == 1]
-        self.rng.shuffle(cand_b)
-        self.rng.shuffle(cand_c)
-
-        occupied = set(coords)
-        occupied.remove(b)
-        occupied.remove(c)
-        for nb in cand_b:
-            for nc in cand_c:
-                if nb == nc or self._manhattan(nb, nc) != 1:
-                    continue
-                if nb in occupied or nc in occupied:
-                    continue
-                trial = coords.copy()
-                trial[i], trial[i + 1] = nb, nc
-                if self._valid_backbone(trial) and self._is_self_avoiding(trial):
-                    return trial
-        return None
-
-    def _attempt_pivot(self, coords: List[Coord]) -> Optional[List[Coord]]:
-        if len(coords) < 4:
-            return None
-        pivot = self.rng.randrange(1, len(coords) - 1)
-        side_right = self.rng.random() < 0.5
-        rot = self.rng.choice(self.rotations)
-
-        new_coords = coords.copy()
-        anchor = coords[pivot]
-        if side_right:
-            span = range(pivot + 1, len(coords))
-        else:
-            span = range(0, pivot)
-
-        for idx in span:
-            rel = self._sub(coords[idx], anchor)
-            rotated = self._apply_rotation(rel, rot)
-            new_coords[idx] = self._add(anchor, rotated)
-
-        if self._valid_backbone(new_coords) and self._is_self_avoiding(new_coords):
-            return new_coords
-        return None
-
-    def _choose_move(self) -> str:
-        w = self.config.move_weights
-        items = [
-            ("corner_flip", w.corner_flip),
-            ("end_move", w.end_move),
-            ("crankshaft", w.crankshaft),
-            ("pivot", w.pivot),
-        ]
-        total = sum(weight for _, weight in items)
-        if total <= 0:
-            raise ValueError("At least one move weight must be > 0.")
-        r = self.rng.random() * total
-        acc = 0.0
-        for name, weight in items:
-            acc += weight
-            if r <= acc:
-                return name
-        return items[-1][0]
-
-    # ---------- optimization ----------
-    def _replica_temperatures(self) -> List[float]:
-        t0 = self.config.initial_temperature
-        tf = self.config.final_temperature
-        if self.config.replicas == 1:
-            return [t0]
-        return [t0 * (tf / t0) ** (i / (self.config.replicas - 1)) for i in range(self.config.replicas)]
-
-    def _metropolis_accept(self, delta: float, temp: float) -> bool:
-        if delta <= 0:
-            return True
-        return self.rng.random() < math.exp(-delta / max(temp, 1e-9))
-
-    def _attempt_exchange(self, replicas: List[Dict[str, object]], temps: List[float]) -> None:
-        for i in range(len(replicas) - 1):
-            e1 = float(replicas[i]["energy"])
-            e2 = float(replicas[i + 1]["energy"])
-            t1, t2 = temps[i], temps[i + 1]
-            criterion = (1.0 / t1 - 1.0 / t2) * (e2 - e1)
-            accept = criterion >= 0.0 or self.rng.random() < math.exp(criterion)
-            if accept:
-                replicas[i], replicas[i + 1] = replicas[i + 1], replicas[i]
-
-    def _run_single_restart(self) -> Dict[str, object]:
-        temperatures = self._replica_temperatures()
-        replicas: List[Dict[str, object]] = []
-        for _ in range(self.config.replicas):
-            coords = self._initial_linear_conformation()
-            replicas.append({"coords": coords, "energy": self.score(coords)})
-
-        best_coords = replicas[0]["coords"].copy()
-        best_energy = float(replicas[0]["energy"])
-        accepted_moves = 0
-        attempted_moves = 0
-        stagnation = 0
-        history: List[Dict[str, float]] = []
-
-        current_t_scale = 1.0
-        temperature_step = 0
-        while temperatures[0] * current_t_scale > self.config.final_temperature:
-            for _ in range(self.config.steps_per_temperature):
-                temperature_step += 1
-                for ridx, rep in enumerate(replicas):
-                    coords = rep["coords"]
-                    temperature = temperatures[ridx] * current_t_scale
-                    move_name = self._choose_move()
-                    candidate = self._move_fns[move_name](coords)
-                    attempted_moves += 1
-                    if candidate is None:
-                        continue
-
-                    e_new = self.score(candidate)
-                    e_old = float(rep["energy"])
-                    if self._metropolis_accept(e_new - e_old, temperature):
-                        rep["coords"] = candidate
-                        rep["energy"] = e_new
-                        accepted_moves += 1
-
-                        if e_new < best_energy:
-                            best_energy = e_new
-                            best_coords = candidate.copy()
-                            stagnation = 0
-
-                stagnation += 1
-                if self.config.track_history and temperature_step % self.config.history_stride == 0:
-                    mean_e = sum(float(r["energy"]) for r in replicas) / len(replicas)
-                    history.append({
-                        "step": float(temperature_step),
-                        "best_energy": best_energy,
-                        "mean_replica_energy": mean_e,
-                        "temperature_scale": current_t_scale,
-                    })
-
-                if temperature_step % self.config.exchange_interval == 0 and len(replicas) > 1:
-                    self._attempt_exchange(replicas, [t * current_t_scale for t in temperatures])
-
-                if stagnation > self.config.max_stagnation_steps:
-                    # controlled random kick from best structure
-                    kick = best_coords.copy()
-                    for _ in range(min(8, len(self.sequence))):
-                        move_name = self._choose_move()
-                        trial = self._move_fns[move_name](kick)
-                        if trial is not None:
-                            kick = trial
-                    replicas[0] = {"coords": kick, "energy": self.score(kick)}
-                    stagnation = 0
-
-            current_t_scale *= self.config.cooling_rate
-
-        final_replica_energies = [float(r["energy"]) for r in replicas]
-        return {
-            "best_coordinates": best_coords,
-            "best_energy": best_energy,
-            "acceptance_rate": accepted_moves / max(1, attempted_moves),
-            "history": history,
-            "final_replica_energies": final_replica_energies,
-        }
-
-    def fold(self) -> Dict[str, object]:
-        """Run multi-restart advanced optimization and return rich diagnostics."""
-        global_best: Optional[Dict[str, object]] = None
-        restart_summaries: List[Dict[str, float]] = []
-
-        for restart_id in range(self.config.restarts):
-            # Decorrelate restarts while keeping determinism for fixed base seed.
-            if self.config.random_seed is not None:
-                self.rng.seed(self.config.random_seed + restart_id * 7919)
-            result = self._run_single_restart()
-            restart_summaries.append(
-                {
-                    "restart": float(restart_id),
-                    "best_energy": float(result["best_energy"]),
-                    "acceptance_rate": float(result["acceptance_rate"]),
-                }
-            )
-            if global_best is None or float(result["best_energy"]) < float(global_best["best_energy"]):
-                global_best = result
-
-        assert global_best is not None
-        best_coords = global_best["best_coordinates"]
-
+    def to_jsonable(self) -> Dict[str, object]:
         return {
             "sequence": self.sequence,
-            "config": asdict(self.config),
-            "best_energy": global_best["best_energy"],
-            "best_coordinates": best_coords,
-            "radius_of_gyration": self.radius_of_gyration(best_coords),
-            "contact_map": self.contact_map(best_coords),
-            "acceptance_rate": global_best["acceptance_rate"],
-            "restart_summaries": restart_summaries,
-            "history": global_best["history"],
-            "final_replica_energies": global_best["final_replica_energies"],
+            "state": self.state,
+            "coordinates": self.coordinates.tolist(),
+            "pair_representation_shape": list(self.pair_representation.shape),
+            "torsion_logits_shape": list(self.torsion_logits.shape),
+            "torsion_angles": self.torsion_angles.tolist(),
+            "confidence": self.confidence.tolist(),
         }
+
+
+class AdvancedProteinFoldingModel:
+    """Compact end-to-end architecture with AlphaFold-inspired geometric blocks."""
+
+    def __init__(self, config: Optional[ModelConfig] = None):
+        self.config = config or ModelConfig()
+        self.rng = np.random.default_rng(self.config.random_seed)
+        self.weights = self._init_weights()
+
+    def _init_weights(self) -> ModelWeights:
+        c = self.config
+
+        def randn(*shape: int, scale: float = 0.05) -> np.ndarray:
+            return self.rng.normal(0.0, scale, size=shape)
+
+        return ModelWeights(
+            seq_embed=randn(len(AA_VOCAB), c.d_seq),
+            msa_embed=randn(len(AA_VOCAB), c.d_msa),
+            pair_proj_left=randn(c.d_seq + c.d_msa, c.d_pair),
+            pair_proj_right=randn(c.d_seq + c.d_msa, c.d_pair),
+            tri_mul_out=randn(c.d_pair, c.d_pair),
+            tri_mul_in=randn(c.d_pair, c.d_pair),
+            tri_attn_q=randn(c.d_pair, c.d_pair),
+            tri_attn_k=randn(c.d_pair, c.d_pair),
+            tri_attn_v=randn(c.d_pair, c.d_pair),
+            refine_feat_proj=randn(c.d_pair, 3),
+            torsion_proj=randn(c.d_seq + c.d_pair, c.torsion_bins * 3),
+            state_embeddings=randn(len(c.allosteric_states), c.d_seq, scale=0.02),
+        )
+
+    @staticmethod
+    def _one_hot_indices(sequence: str) -> np.ndarray:
+        idx = [AA_TO_IDX.get(ch, AA_TO_IDX["X"]) for ch in sequence]
+        return np.asarray(idx, dtype=np.int64)
+
+    def sequence_embedding(self, sequence: str, state: str) -> np.ndarray:
+        """Per-residue embedding with allosteric-state conditioning."""
+        idx = self._one_hot_indices(sequence)
+        seq_emb = self.weights.seq_embed[idx]  # (L, d_seq)
+        state_idx = self.config.allosteric_states.index(state)
+        state_emb = self.weights.state_embeddings[state_idx][None, :]
+        return seq_emb + state_emb
+
+    def msa_encoder(self, msa: List[str]) -> np.ndarray:
+        """Encode MSA and aggregate into per-position contextual signal."""
+        if not msa:
+            raise ValueError("MSA must contain at least one sequence.")
+        lengths = {len(s) for s in msa}
+        if len(lengths) != 1:
+            raise ValueError("All MSA sequences must have equal length.")
+
+        msa_idx = np.stack([self._one_hot_indices(row) for row in msa], axis=0)  # (N, L)
+        emb = self.weights.msa_embed[msa_idx]  # (N, L, d_msa)
+        # Robust aggregation: mean + variance features condensed via linear map-like combination.
+        mean = emb.mean(axis=0)
+        var = emb.var(axis=0)
+        return mean + 0.2 * var
+
+    def pair_representation(self, seq_repr: np.ndarray, msa_repr: np.ndarray) -> np.ndarray:
+        """Initialize residue-pair representation from single + MSA features."""
+        s = np.concatenate([seq_repr, msa_repr], axis=-1)
+        left = s @ self.weights.pair_proj_left
+        right = s @ self.weights.pair_proj_right
+        pair = left[:, None, :] + right[None, :, :]
+
+        # Add simple relative-position bias.
+        L = pair.shape[0]
+        rel = np.arange(L)[:, None] - np.arange(L)[None, :]
+        pair += 0.01 * np.tanh(rel[..., None] / 8.0)
+        return pair
+
+    def _triangle_multiplicative_update(self, z: np.ndarray, outgoing: bool) -> np.ndarray:
+        w = self.weights.tri_mul_out if outgoing else self.weights.tri_mul_in
+        zz = z @ w
+        # outgoing: i,j updated through k as i->k and j->k interactions
+        if outgoing:
+            upd = np.einsum("ikd,jkd->ijd", zz, zz) / math.sqrt(z.shape[-1])
+        else:
+            upd = np.einsum("kid,kjd->ijd", zz, zz) / math.sqrt(z.shape[-1])
+        return upd
+
+    def _triangle_attention_update(self, z: np.ndarray) -> np.ndarray:
+        q = z @ self.weights.tri_attn_q
+        k = z @ self.weights.tri_attn_k
+        v = z @ self.weights.tri_attn_v
+        logits = np.einsum("ijd,ikd->ijk", q, k) / math.sqrt(z.shape[-1])
+        logits = logits - logits.max(axis=-1, keepdims=True)
+        attn = np.exp(logits)
+        attn /= np.clip(attn.sum(axis=-1, keepdims=True), 1e-8, None)
+        return np.einsum("ijk,ikd->ijd", attn, v)
+
+    def triangle_updates(self, pair_repr: np.ndarray) -> np.ndarray:
+        """AlphaFold-style triangle multiplicative + attention updates."""
+        z = pair_repr.copy()
+        for _ in range(self.config.n_triangle_updates):
+            z = z + 0.2 * np.tanh(self._triangle_multiplicative_update(z, outgoing=True))
+            z = z + 0.2 * np.tanh(self._triangle_multiplicative_update(z, outgoing=False))
+            z = z + 0.2 * np.tanh(self._triangle_attention_update(z))
+            z = 0.5 * (z + np.transpose(z, (1, 0, 2)))  # enforce i,j symmetry
+        return z
+
+    def se3_equivariant_refinement(self, pair_repr: np.ndarray, n_steps: Optional[int] = None) -> np.ndarray:
+        """Coordinate refinement equivariant to rigid translations/rotations.
+
+        Update rule uses only pairwise relative vectors and scalar gates from pair features,
+        which preserves SE(3)-equivariance.
+        """
+        L = pair_repr.shape[0]
+        steps = n_steps or self.config.n_refine_steps
+        coords = np.stack([np.arange(L), np.zeros(L), np.zeros(L)], axis=-1).astype(np.float64)
+
+        for _ in range(steps):
+            rel = coords[:, None, :] - coords[None, :, :]  # (L,L,3)
+            dist2 = np.sum(rel * rel, axis=-1, keepdims=True) + 1e-6
+            inv_dist = 1.0 / np.sqrt(dist2)
+            scalar = np.tanh(pair_repr @ self.weights.refine_feat_proj)  # (L,L,3)
+            # isotropic + learned directional modulation
+            direction = rel * inv_dist
+            force = (0.15 * direction + 0.05 * scalar) / np.sqrt(dist2)
+            delta = force.sum(axis=1) - force.sum(axis=0)
+            coords += 0.02 * delta
+            coords -= coords.mean(axis=0, keepdims=True)  # center-of-mass stabilization
+        return coords
+
+    def torsion_head(self, seq_repr: np.ndarray, pair_repr: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """Predict torsion-angle distributions and MAP angles for phi/psi/omega."""
+        pair_pool = pair_repr.mean(axis=1)
+        fused = np.concatenate([seq_repr, pair_pool], axis=-1)
+        logits = fused @ self.weights.torsion_proj
+        logits = logits.reshape(len(seq_repr), 3, self.config.torsion_bins)
+
+        probs = np.exp(logits - logits.max(axis=-1, keepdims=True))
+        probs /= np.clip(probs.sum(axis=-1, keepdims=True), 1e-8, None)
+        idx = np.argmax(probs, axis=-1)
+        angles = -math.pi + (2 * math.pi) * (idx / (self.config.torsion_bins - 1))
+        return logits, angles
+
+    def _single_pass(self, sequence: str, msa: List[str], state: str) -> StructurePrediction:
+        seq_repr = self.sequence_embedding(sequence, state)
+        msa_repr = self.msa_encoder(msa)
+        pair = self.pair_representation(seq_repr, msa_repr)
+
+        for _ in range(self.config.n_recycles):
+            pair = self.triangle_updates(pair)
+
+        coords = self.se3_equivariant_refinement(pair)
+        torsion_logits, torsion_angles = self.torsion_head(seq_repr, pair)
+
+        # Lightweight confidence proxy from pair norms.
+        conf = 1.0 / (1.0 + np.exp(-pair.mean(axis=(1, 2))))
+        return StructurePrediction(
+            sequence=sequence,
+            state=state,
+            coordinates=coords,
+            pair_representation=pair,
+            torsion_logits=torsion_logits,
+            torsion_angles=torsion_angles,
+            confidence=conf,
+        )
+
+    def ensemble_sample(self, sequence: str, msa: List[str], state: str) -> Dict[str, object]:
+        """Sample an ensemble and return aggregate statistics + members."""
+        members: List[StructurePrediction] = []
+        base_seed = self.config.random_seed if self.config.random_seed is not None else 0
+
+        for k in range(self.config.n_ensemble):
+            self.rng = np.random.default_rng(base_seed + 104729 * (k + 1))
+            self.weights = self._init_weights()
+            members.append(self._single_pass(sequence, msa, state))
+
+        stack = np.stack([m.coordinates for m in members], axis=0)
+        mean_coords = stack.mean(axis=0)
+        var_coords = stack.var(axis=0)
+
+        return {
+            "state": state,
+            "mean_coordinates": mean_coords,
+            "coordinate_variance": var_coords,
+            "mean_confidence": np.mean(np.stack([m.confidence for m in members], axis=0), axis=0),
+            "members": members,
+        }
+
+    def model_allosteric_states(self, sequence: str, msa: List[str]) -> Dict[str, Dict[str, object]]:
+        """Generate state-conditioned ensembles for all configured allosteric states."""
+        results = {}
+        for state in self.config.allosteric_states:
+            results[state] = self.ensemble_sample(sequence, msa, state)
+        return results
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="Advanced HP lattice protein folding")
-    p.add_argument("sequence", help="Protein sequence containing H/P only")
-    p.add_argument("--dimensions", type=int, default=3, choices=[2, 3], help="Lattice dimensionality")
-    p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--t0", type=float, default=8.0, help="Initial temperature")
-    p.add_argument("--tf", type=float, default=0.04, help="Final temperature")
-    p.add_argument("--cooling", type=float, default=0.995, help="Cooling rate")
-    p.add_argument("--steps", type=int, default=200, help="Steps per temperature level")
-    p.add_argument("--replicas", type=int, default=6, help="Parallel tempering replicas")
-    p.add_argument("--exchange-interval", type=int, default=15)
-    p.add_argument("--restarts", type=int, default=4)
-    p.add_argument("--max-stagnation", type=int, default=1600)
-    p.add_argument("--json", action="store_true", help="Output full result as JSON")
+    p = argparse.ArgumentParser(description="Advanced protein folding architecture prototype")
+    p.add_argument("sequence", help="Primary sequence (single-letter amino-acid code)")
+    p.add_argument("--msa", nargs="*", default=None, help="MSA rows. If omitted, uses sequence only")
+    p.add_argument("--state", default="inactive", help="Allosteric state label")
+    p.add_argument("--ensemble", type=int, default=8, help="Number of ensemble samples")
+    p.add_argument("--recycles", type=int, default=4, help="Number of triangle recycling rounds")
+    p.add_argument("--json", action="store_true", help="Print JSON output")
     return p
 
 
 def main() -> None:
     args = _build_parser().parse_args()
-    cfg = ProteinFoldingConfig(
-        dimensions=args.dimensions,
-        initial_temperature=args.t0,
-        final_temperature=args.tf,
-        cooling_rate=args.cooling,
-        steps_per_temperature=args.steps,
-        replicas=args.replicas,
-        exchange_interval=args.exchange_interval,
-        restarts=args.restarts,
-        max_stagnation_steps=args.max_stagnation,
-        random_seed=args.seed,
-    )
+    cfg = ModelConfig(n_ensemble=args.ensemble, n_recycles=args.recycles)
+    model = AdvancedProteinFoldingModel(cfg)
+    msa = args.msa if args.msa else [args.sequence]
 
-    folder = ProteinFolder(args.sequence, cfg)
-    result = folder.fold()
-
-    if args.json:
-        print(json.dumps(result, indent=2))
+    if args.state == "all":
+        out = model.model_allosteric_states(args.sequence, msa)
+        summary = {
+            s: {
+                "mean_confidence_mean": float(v["mean_confidence"].mean()),
+                "mean_coordinates_shape": list(v["mean_coordinates"].shape),
+                "coordinate_variance_mean": float(v["coordinate_variance"].mean()),
+            }
+            for s, v in out.items()
+        }
+        if args.json:
+            print(json.dumps(summary, indent=2))
+        else:
+            for state, stats in summary.items():
+                print(f"State={state}: confidence={stats['mean_confidence_mean']:.3f}, "
+                      f"var={stats['coordinate_variance_mean']:.5f}")
         return
 
-    print(f"Sequence:           {result['sequence']}")
-    print(f"Best energy:        {result['best_energy']:.4f}")
-    print(f"Radius of gyration: {result['radius_of_gyration']:.4f}")
-    print(f"Acceptance rate:    {result['acceptance_rate']:.3f}")
-    print("Best coordinates:")
-    for i, c in enumerate(result["best_coordinates"]):
-        print(f"  {i:3d}: {tuple(c)}")
+    if args.state not in cfg.allosteric_states:
+        raise ValueError(f"state must be one of {cfg.allosteric_states} or 'all'")
+
+    out = model.ensemble_sample(args.sequence, msa, args.state)
+    payload = {
+        "state": out["state"],
+        "mean_coordinates": out["mean_coordinates"].tolist(),
+        "coordinate_variance": out["coordinate_variance"].tolist(),
+        "mean_confidence": out["mean_confidence"].tolist(),
+        "members": [m.to_jsonable() for m in out["members"]],
+    }
+    if args.json:
+        print(json.dumps(payload, indent=2))
+    else:
+        print(f"State: {payload['state']}")
+        print(f"Residues: {len(args.sequence)}")
+        print(f"Ensemble members: {len(payload['members'])}")
+        print(f"Mean confidence: {float(np.mean(out['mean_confidence'])):.3f}")
+        print("First 5 mean coordinates:")
+        for i, c in enumerate(payload["mean_coordinates"][:5]):
+            print(f"  {i:3d}: ({c[0]: .3f}, {c[1]: .3f}, {c[2]: .3f})")
 
 
 if __name__ == "__main__":

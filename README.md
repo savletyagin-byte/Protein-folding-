@@ -1,48 +1,46 @@
-# Advanced Protein Folding (HP Lattice + Parallel Tempering)
+# Advanced Protein Folding Architecture Prototype
 
-This project provides an **advanced lattice-based protein folding optimizer** for HP sequences.
+This repository now provides a **modern, architecture-level protein folding prototype** with the requested advanced components:
 
-## Advanced features
+- Sequence embedding
+- MSA encoder
+- Residue–residue pair representation
+- AlphaFold-style triangle updates
+- SE(3)-equivariant coordinate refinement
+- Torsion angle head
+- Ensemble sampling
+- Allosteric state modeling
 
-- **2D or 3D lattice** folding (`--dimensions`).
-- **Self-avoiding walk** constraints and backbone connectivity checks.
-- **Multi-term energy model**:
-  - H-H, H-P, P-P non-bonded contact terms,
-  - bend penalty,
-  - compactness bonus using radius of gyration.
-- **Advanced move set**:
-  - end move,
-  - corner flip,
-  - crankshaft,
-  - pivot rotation move.
-- **Parallel tempering** replica exchange + cooling schedule.
-- **Multi-restart global search** with stagnation kick.
-- Rich outputs: best coordinates, contact map, radius of gyration, acceptance rate, restart summaries, optional JSON.
+> Implementation note: this is a NumPy-only educational/research prototype focused on architecture and geometric principles, not a production-trained model.
 
-## Run
+## Quick start
 
 ```bash
-python protein_folding.py HPPHHPHPPHH --restarts 6 --replicas 8 --steps 300
+python protein_folding.py ACDEFGHIK --msa ACDEFGHIK ACDEYGHIK ACDEFGHVK --state active
 ```
 
-JSON output:
+### JSON output
 
 ```bash
-python protein_folding.py HPPHHPHPPHH --json
+python protein_folding.py ACDEFGHIK --json
 ```
 
-2D mode:
+### All allosteric states at once
 
 ```bash
-python protein_folding.py HPPHHPHPPHH --dimensions 2
+python protein_folding.py ACDEFGHIK --state all --json
 ```
+
+## CLI flags
+
+- `--msa ...` : provide MSA rows; defaults to sequence-only.
+- `--state` : one of `inactive`, `active`, `intermediate`, or `all`.
+- `--ensemble` : number of ensemble samples.
+- `--recycles` : number of triangle-recycling passes.
+- `--json` : machine-readable output.
 
 ## Tests
 
 ```bash
 pytest -q
 ```
-
-## Notes
-
-This is still a simplified educational computational model and not an atomistic molecular dynamics engine.
