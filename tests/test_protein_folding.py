@@ -99,3 +99,13 @@ def test_can_export_prediction_to_pdb(tmp_path: Path):
     out = tmp_path / "pred.pdb"
     out.write_text(pdb_text)
     assert out.exists()
+
+
+def test_can_export_prediction_image(tmp_path: Path):
+    model = TrainableProteinModel(ModelConfig(d_hidden=16, torsion_bins=12, dist_bins=12))
+    pred = model.predict("ACDEF")
+    out = tmp_path / "pred.png"
+    from protein_folding import save_structure_image
+
+    save_structure_image(pred.coords, str(out), title="test")
+    assert out.exists()

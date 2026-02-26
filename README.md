@@ -88,3 +88,18 @@ python protein_folding.py ACDEFGHIK   --load-model trained_models/demo.json   --
 ```
 
 Then open `outputs/predicted_ca_trace.pdb` in PyMOL/ChimeraX/VMD.
+
+
+## Generate a picture for each analyzed protein
+
+During training/evaluation, export one PNG per analyzed structure:
+
+```bash
+python protein_folding.py ACDEFGHIK   --train-pdb-files data/sample_train.pdb   --export-analysis-images-dir outputs/analysis_images
+```
+
+For a single prediction image:
+
+```bash
+python protein_folding.py ACDEFGHIK   --load-model trained_models/demo.json   --save-pred-image outputs/predicted_structure.png
+```

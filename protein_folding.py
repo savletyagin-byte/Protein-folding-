@@ -27,6 +27,9 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import autograd.numpy as anp
 from autograd import grad
 import numpy as np
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 from Bio.PDB import PDBList, PDBParser, is_aa
 
 AA_VOCAB = "ACDEFGHIKLMNPQRSTVWY-X"
@@ -107,6 +110,28 @@ class Prediction:
         lines.append("TER")
         lines.append("END")
         return "\n".join(lines) + "\n"
+
+
+
+
+def save_structure_image(coords: np.ndarray, out_path: str, title: str = "Predicted Protein") -> None:
+    out = Path(out_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+
+    fig = plt.figure(figsize=(6, 5), dpi=140)
+    ax = fig.add_subplot(111, projection="3d")
+
+    x, y, z = coords[:, 0], coords[:, 1], coords[:, 2]
+    ax.plot(x, y, z, linewidth=1.8, alpha=0.85)
+    ax.scatter(x, y, z, s=14, c=range(len(coords)), cmap="viridis")
+
+    ax.set_title(title)
+    ax.set_xlabel("X")
+    ax.set_ylabel("Y")
+    ax.set_zlabel("Z")
+    plt.tight_layout()
+    fig.savefig(out)
+    plt.close(fig)
 
 
 @dataclass
@@ -467,6 +492,16 @@ class TrainableProteinModel:
             "distance_mae": float(np.mean(maes)),
         }
 
+
+    def evaluate_and_export_images(self, dataset: RealStructureDataset, out_dir: str) -> Dict[str, float]:
+        out = Path(out_dir)
+        out.mkdir(parents=True, exist_ok=True)
+        metrics = self.evaluate(dataset)
+        for ex in dataset.examples:
+            pred = self.predict(ex.sequence)
+            save_structure_image(pred.coords, str(out / f"{ex.pdb_id}.png"), title=f"Predicted {ex.pdb_id}")
+        return metrics
+
     def predict(self, sequence: str) -> Prediction:
         x = self._encode(sequence)
         coords, tors, dist, conf = self._forward_autograd(self.params, anp.asarray(x), training=False)
@@ -529,6 +564,8 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--save-model", default=None)
     p.add_argument("--load-model", default=None)
     p.add_argument("--save-pred-pdb", default=None, help="Write predicted CA trace to a PDB file")
+    p.add_argument("--save-pred-image", default=None, help="Write predicted structure image PNG")
+    p.add_argument("--export-analysis-images-dir", default=None, help="When training, export one PNG per analyzed protein")
     return p
 
 
@@ -554,14 +591,20 @@ def main() -> None:
         ds = RealStructureDataset.from_local_pdbs(args.train_pdb_files, min_len=5)
         if ds.examples:
             fit_result = model.fit(ds)
-            eval_metrics = model.evaluate(ds)
+            if args.export_analysis_images_dir:
+                eval_metrics = model.evaluate_and_export_images(ds, args.export_analysis_images_dir)
+            else:
+                eval_metrics = model.evaluate(ds)
             trained = True
 
     if args.train_pdb_ids:
         ds = RealStructureDataset.from_rcsb_ids(args.train_pdb_ids, min_len=5)
         if ds.examples:
             fit_result = model.fit(ds)
-            eval_metrics = model.evaluate(ds)
+            if args.export_analysis_images_dir:
+                eval_metrics = model.evaluate_and_export_images(ds, args.export_analysis_images_dir)
+            else:
+                eval_metrics = model.evaluate(ds)
             trained = True
 
     if args.save_model and trained:
@@ -574,6 +617,8 @@ def main() -> None:
             out_pdb = Path(args.save_pred_pdb)
             out_pdb.parent.mkdir(parents=True, exist_ok=True)
             out_pdb.write_text(pred.to_pdb())
+        if args.save_pred_image:
+            save_structure_image(pred.coords, args.save_pred_image, title=f"Predicted {pred.sequence}")
         out = {
             "sequence": pred.sequence,
             "trained": trained,
@@ -592,6 +637,8 @@ def main() -> None:
             "confidence": pred.confidence.tolist(),
             "saved_model": args.save_model if (args.save_model and trained) else None,
             "saved_prediction_pdb": args.save_pred_pdb if args.save_pred_pdb else None,
+            "saved_prediction_image": args.save_pred_image if args.save_pred_image else None,
+            "analysis_images_dir": args.export_analysis_images_dir if args.export_analysis_images_dir else None,
         }
 
         if args.ensemble_size > 0:
