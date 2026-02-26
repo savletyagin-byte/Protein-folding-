@@ -1,25 +1,43 @@
-# Protein Folding (HP Lattice + Simulated Annealing)
+# Advanced Protein Folding (HP Lattice + Parallel Tempering)
 
-This repository contains a compact protein folding implementation using a **3D lattice HP model**:
+This project provides an **advanced lattice-based protein folding optimizer** for HP sequences.
 
-- Amino acids are modeled as `H` (hydrophobic) or `P` (polar).
-- A conformation is a self-avoiding walk on a cubic lattice.
-- The energy function rewards non-consecutive neighboring `H-H` contacts (`-1` per contact).
-- Search is performed with simulated annealing and local moves (corner flip, end move, crankshaft).
+## Advanced features
+
+- **2D or 3D lattice** folding (`--dimensions`).
+- **Self-avoiding walk** constraints and backbone connectivity checks.
+- **Multi-term energy model**:
+  - H-H, H-P, P-P non-bonded contact terms,
+  - bend penalty,
+  - compactness bonus using radius of gyration.
+- **Advanced move set**:
+  - end move,
+  - corner flip,
+  - crankshaft,
+  - pivot rotation move.
+- **Parallel tempering** replica exchange + cooling schedule.
+- **Multi-restart global search** with stagnation kick.
+- Rich outputs: best coordinates, contact map, radius of gyration, acceptance rate, restart summaries, optional JSON.
 
 ## Run
 
 ```bash
-python protein_folding.py HPPHHPHPPHH
+python protein_folding.py HPPHHPHPPHH --restarts 6 --replicas 8 --steps 300
 ```
 
-Optional tuning:
+JSON output:
 
 ```bash
-python protein_folding.py HPPHHPHPPHH --seed 1 --t0 10 --tf 0.05 --cooling 0.995 --steps 500
+python protein_folding.py HPPHHPHPPHH --json
 ```
 
-## Test
+2D mode:
+
+```bash
+python protein_folding.py HPPHHPHPPHH --dimensions 2
+```
+
+## Tests
 
 ```bash
 pytest -q
@@ -27,4 +45,4 @@ pytest -q
 
 ## Notes
 
-This is a simplified educational model, not an atomistic physics simulation.
+This is still a simplified educational computational model and not an atomistic molecular dynamics engine.
