@@ -38,6 +38,13 @@ RES3_TO_1 = {
 }
 
 
+
+RES1_TO_3 = {
+    "A": "ALA", "R": "ARG", "N": "ASN", "D": "ASP", "C": "CYS", "Q": "GLN", "E": "GLU", "G": "GLY",
+    "H": "HIS", "I": "ILE", "L": "LEU", "K": "LYS", "M": "MET", "F": "PHE", "P": "PRO", "S": "SER",
+    "T": "THR", "W": "TRP", "Y": "TYR", "V": "VAL", "X": "UNK", "-": "GLY",
+}
+
 @dataclass
 class ModelConfig:
     d_hidden: int = 160
@@ -86,6 +93,20 @@ class Prediction:
     torsion_logits: np.ndarray
     distogram_logits: np.ndarray
     confidence: np.ndarray
+
+    def to_pdb(self, chain_id: str = "A") -> str:
+        lines = []
+        for i, (aa, c) in enumerate(zip(self.sequence, self.coords), start=1):
+            resname = RES1_TO_3.get(aa, "UNK")
+            x, y, z = float(c[0]), float(c[1]), float(c[2])
+            line = (
+                f"ATOM  {i:5d}  CA  {resname:>3s} {chain_id}{i:4d}    "
+                f"{x:8.3f}{y:8.3f}{z:8.3f}  1.00 20.00           C"
+            )
+            lines.append(line)
+        lines.append("TER")
+        lines.append("END")
+        return "\n".join(lines) + "\n"
 
 
 @dataclass
@@ -507,6 +528,7 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--json", action="store_true")
     p.add_argument("--save-model", default=None)
     p.add_argument("--load-model", default=None)
+    p.add_argument("--save-pred-pdb", default=None, help="Write predicted CA trace to a PDB file")
     return p
 
 
@@ -548,6 +570,10 @@ def main() -> None:
 
     if args.sequence:
         pred = model.predict(args.sequence)
+        if args.save_pred_pdb:
+            out_pdb = Path(args.save_pred_pdb)
+            out_pdb.parent.mkdir(parents=True, exist_ok=True)
+            out_pdb.write_text(pred.to_pdb())
         out = {
             "sequence": pred.sequence,
             "trained": trained,
@@ -565,6 +591,7 @@ def main() -> None:
             "distogram_logits_shape": list(pred.distogram_logits.shape),
             "confidence": pred.confidence.tolist(),
             "saved_model": args.save_model if (args.save_model and trained) else None,
+            "saved_prediction_pdb": args.save_pred_pdb if args.save_pred_pdb else None,
         }
 
         if args.ensemble_size > 0:

@@ -68,3 +68,23 @@ If you want the full flow automated (install deps, train on included sample, the
 ```
 
 This writes a JSON checkpoint to `trained_models/demo.json`.
+
+
+## Export generated protein as PDB (so you can view it)
+
+```bash
+python protein_folding.py ACDEFGHIK   --load-model trained_models/demo.json   --save-pred-pdb outputs/predicted_ca_trace.pdb
+```
+
+Then open `outputs/predicted_ca_trace.pdb` in a molecular viewer (e.g., PyMOL/ChimeraX) to see the generated structure.
+
+
+## See the generated protein structure
+
+Export the predicted structure as a PDB file:
+
+```bash
+python protein_folding.py ACDEFGHIK   --load-model trained_models/demo.json   --save-pred-pdb outputs/predicted_ca_trace.pdb
+```
+
+Then open `outputs/predicted_ca_trace.pdb` in PyMOL/ChimeraX/VMD.

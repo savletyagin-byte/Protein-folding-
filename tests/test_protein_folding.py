@@ -88,3 +88,14 @@ def test_save_and_load_roundtrip(tmp_path: Path):
     p1 = model.predict("ACDEF")
     p2 = model2.predict("ACDEF")
     assert np.allclose(p1.coords, p2.coords)
+
+
+def test_can_export_prediction_to_pdb(tmp_path: Path):
+    model = TrainableProteinModel(ModelConfig(d_hidden=16, torsion_bins=12, dist_bins=12))
+    pred = model.predict("ACDEF")
+    pdb_text = pred.to_pdb()
+    assert "ATOM" in pdb_text and "END" in pdb_text
+
+    out = tmp_path / "pred.pdb"
+    out.write_text(pdb_text)
+    assert out.exists()
