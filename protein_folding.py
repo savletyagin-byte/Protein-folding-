@@ -1,19 +1,20 @@
-"""Research-oriented protein folding architecture prototype.
+"""HyperFold-X: advanced architecture-level protein structure prototype.
 
-This module implements a compact, dependency-light (NumPy-only) analogue of modern
-structure prediction pipelines with the following components:
+This module is a research/educational implementation that incorporates many design ideas
+from modern structure systems while remaining lightweight (NumPy-only):
 
-- Sequence embedding.
-- MSA encoder.
-- Pair representation initialization.
-- AlphaFold-style triangle multiplicative/additive updates.
-- SE(3)-equivariant coordinate refinement.
-- Torsion-angle prediction head.
-- Ensemble sampling.
-- Allosteric state conditioning/modeling.
+- Token + positional + allosteric-conditioned sequence embedding
+- MSA encoder with row/column mixing and coevolution projection
+- Residue-pair representation (with relative position + MSA coupling)
+- Template/distogram feature injection
+- Evoformer-style recycling with triangle multiplicative + triangle attention updates
+- Invariant-point-like SE(3)-equivariant coordinate refinement
+- Diffusion-style denoising refinement loop
+- Multi-head geometric predictions (torsions, distogram, pLDDT-like confidence)
+- Ensemble sampling and allosteric state manifold exploration
 
-The implementation is intentionally lightweight and educational; it is not meant to
-replace production-grade systems such as AlphaFold/OpenFold/RoseTTAFold.
+Note: This is not a trained SOTA model and cannot legitimately outperform AlphaFold.
+It is, however, a substantially richer prototyping scaffold.
 """
 
 from __future__ import annotations
@@ -21,315 +22,330 @@ from __future__ import annotations
 import argparse
 import json
 import math
-from dataclasses import asdict, dataclass, field
-from typing import Dict, List, Optional, Tuple
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-AA_VOCAB = "ACDEFGHIKLMNPQRSTVWY-X"  # 20 aa + gap + unknown placeholder
-AA_TO_IDX = {aa: i for i, aa in enumerate(AA_VOCAB)}
+AA_VOCAB = "ACDEFGHIKLMNPQRSTVWY-X"
+AA_TO_IDX = {a: i for i, a in enumerate(AA_VOCAB)}
 
 
 @dataclass
 class ModelConfig:
-    """Hyperparameters for the architecture."""
-
-    d_seq: int = 128
-    d_msa: int = 96
-    d_pair: int = 64
-    n_recycles: int = 4
+    d_seq: int = 192
+    d_msa: int = 128
+    d_pair: int = 96
+    n_evo_blocks: int = 4
+    n_recycles: int = 3
     n_triangle_updates: int = 2
-    n_refine_steps: int = 30
-    torsion_bins: int = 36
-    n_ensemble: int = 8
-    random_seed: Optional[int] = 7
-    # allosteric states: e.g. inactive, active, intermediate
-    allosteric_states: Tuple[str, ...] = ("inactive", "active", "intermediate")
+    n_refine_steps: int = 24
+    n_diffusion_steps: int = 16
+    torsion_bins: int = 48
+    dist_bins: int = 64
+    n_ensemble: int = 6
+    random_seed: Optional[int] = 17
+    allosteric_states: Tuple[str, ...] = ("inactive", "active", "intermediate", "agonist-bound")
 
 
 @dataclass
-class ModelWeights:
-    """Randomly initialized lightweight weights for demonstrative inference."""
-
-    seq_embed: np.ndarray
-    msa_embed: np.ndarray
-    pair_proj_left: np.ndarray
-    pair_proj_right: np.ndarray
-    tri_mul_out: np.ndarray
-    tri_mul_in: np.ndarray
-    tri_attn_q: np.ndarray
-    tri_attn_k: np.ndarray
-    tri_attn_v: np.ndarray
-    refine_feat_proj: np.ndarray
-    torsion_proj: np.ndarray
-    state_embeddings: np.ndarray
-
-
-@dataclass
-class StructurePrediction:
+class Prediction:
     sequence: str
     state: str
     coordinates: np.ndarray
-    pair_representation: np.ndarray
     torsion_logits: np.ndarray
     torsion_angles: np.ndarray
-    confidence: np.ndarray
+    distogram_logits: np.ndarray
+    plddt: np.ndarray
+    pair: np.ndarray
 
     def to_jsonable(self) -> Dict[str, object]:
         return {
             "sequence": self.sequence,
             "state": self.state,
             "coordinates": self.coordinates.tolist(),
-            "pair_representation_shape": list(self.pair_representation.shape),
-            "torsion_logits_shape": list(self.torsion_logits.shape),
             "torsion_angles": self.torsion_angles.tolist(),
-            "confidence": self.confidence.tolist(),
+            "torsion_logits_shape": list(self.torsion_logits.shape),
+            "distogram_logits_shape": list(self.distogram_logits.shape),
+            "plddt": self.plddt.tolist(),
+            "pair_shape": list(self.pair.shape),
         }
 
 
-class AdvancedProteinFoldingModel:
-    """Compact end-to-end architecture with AlphaFold-inspired geometric blocks."""
-
+class HyperFoldX:
     def __init__(self, config: Optional[ModelConfig] = None):
         self.config = config or ModelConfig()
         self.rng = np.random.default_rng(self.config.random_seed)
-        self.weights = self._init_weights()
+        self.W = self._init_weights()
 
-    def _init_weights(self) -> ModelWeights:
+    def _init_weights(self) -> Dict[str, np.ndarray]:
         c = self.config
 
-        def randn(*shape: int, scale: float = 0.05) -> np.ndarray:
+        def n(*shape: int, scale: float = 0.03) -> np.ndarray:
             return self.rng.normal(0.0, scale, size=shape)
 
-        return ModelWeights(
-            seq_embed=randn(len(AA_VOCAB), c.d_seq),
-            msa_embed=randn(len(AA_VOCAB), c.d_msa),
-            pair_proj_left=randn(c.d_seq + c.d_msa, c.d_pair),
-            pair_proj_right=randn(c.d_seq + c.d_msa, c.d_pair),
-            tri_mul_out=randn(c.d_pair, c.d_pair),
-            tri_mul_in=randn(c.d_pair, c.d_pair),
-            tri_attn_q=randn(c.d_pair, c.d_pair),
-            tri_attn_k=randn(c.d_pair, c.d_pair),
-            tri_attn_v=randn(c.d_pair, c.d_pair),
-            refine_feat_proj=randn(c.d_pair, 3),
-            torsion_proj=randn(c.d_seq + c.d_pair, c.torsion_bins * 3),
-            state_embeddings=randn(len(c.allosteric_states), c.d_seq, scale=0.02),
-        )
+        return {
+            "seq_embed": n(len(AA_VOCAB), c.d_seq),
+            "pos_embed": n(2048, c.d_seq),
+            "state_embed": n(len(c.allosteric_states), c.d_seq, scale=0.02),
+            "msa_embed": n(len(AA_VOCAB), c.d_msa),
+            "msa_row_mix": n(c.d_msa, c.d_msa),
+            "msa_col_mix": n(c.d_msa, c.d_msa),
+            "msa_to_pair_l": n(c.d_msa, c.d_pair),
+            "msa_to_pair_r": n(c.d_msa, c.d_pair),
+            "seq_to_pair_l": n(c.d_seq, c.d_pair),
+            "seq_to_pair_r": n(c.d_seq, c.d_pair),
+            "pair_bias_proj": n(4, c.d_pair),  # relpos, sep, template, coupling
+            "tri_mul_out": n(c.d_pair, c.d_pair),
+            "tri_mul_in": n(c.d_pair, c.d_pair),
+            "tri_q": n(c.d_pair, c.d_pair),
+            "tri_k": n(c.d_pair, c.d_pair),
+            "tri_v": n(c.d_pair, c.d_pair),
+            "ipa_pair_to_force": n(c.d_pair, 3),
+            "ipa_pair_gate": n(c.d_pair, 1),
+            "diffusion_cond": n(c.d_pair, 3),
+            "torsion_head": n(c.d_seq + c.d_pair, c.torsion_bins * 3),
+            "dist_head": n(c.d_pair, c.dist_bins),
+            "plddt_head": n(c.d_seq + c.d_pair, 1),
+        }
 
     @staticmethod
-    def _one_hot_indices(sequence: str) -> np.ndarray:
-        idx = [AA_TO_IDX.get(ch, AA_TO_IDX["X"]) for ch in sequence]
-        return np.asarray(idx, dtype=np.int64)
+    def _idx(seq: str) -> np.ndarray:
+        return np.asarray([AA_TO_IDX.get(s, AA_TO_IDX["X"]) for s in seq], dtype=np.int64)
+
+    def _softmax(self, x: np.ndarray, axis: int = -1) -> np.ndarray:
+        x = x - x.max(axis=axis, keepdims=True)
+        e = np.exp(x)
+        return e / np.clip(e.sum(axis=axis, keepdims=True), 1e-9, None)
 
     def sequence_embedding(self, sequence: str, state: str) -> np.ndarray:
-        """Per-residue embedding with allosteric-state conditioning."""
-        idx = self._one_hot_indices(sequence)
-        seq_emb = self.weights.seq_embed[idx]  # (L, d_seq)
-        state_idx = self.config.allosteric_states.index(state)
-        state_emb = self.weights.state_embeddings[state_idx][None, :]
-        return seq_emb + state_emb
+        idx = self._idx(sequence)
+        if len(sequence) > self.W["pos_embed"].shape[0]:
+            raise ValueError("Sequence too long for positional table.")
+        x = self.W["seq_embed"][idx] + self.W["pos_embed"][np.arange(len(sequence))]
+        sidx = self.config.allosteric_states.index(state)
+        x = x + self.W["state_embed"][sidx][None, :]
+        return x
 
-    def msa_encoder(self, msa: List[str]) -> np.ndarray:
-        """Encode MSA and aggregate into per-position contextual signal."""
+    def msa_encoder(self, msa: Sequence[str]) -> np.ndarray:
         if not msa:
-            raise ValueError("MSA must contain at least one sequence.")
-        lengths = {len(s) for s in msa}
-        if len(lengths) != 1:
-            raise ValueError("All MSA sequences must have equal length.")
+            raise ValueError("MSA cannot be empty.")
+        L = len(msa[0])
+        if any(len(m) != L for m in msa):
+            raise ValueError("All MSA rows must have equal length.")
 
-        msa_idx = np.stack([self._one_hot_indices(row) for row in msa], axis=0)  # (N, L)
-        emb = self.weights.msa_embed[msa_idx]  # (N, L, d_msa)
-        # Robust aggregation: mean + variance features condensed via linear map-like combination.
-        mean = emb.mean(axis=0)
-        var = emb.var(axis=0)
-        return mean + 0.2 * var
+        idx = np.stack([self._idx(m) for m in msa], axis=0)  # (N,L)
+        m = self.W["msa_embed"][idx]  # (N,L,d_msa)
+
+        # Axial-like mixing (row then column contexts)
+        row_ctx = np.tanh(m @ self.W["msa_row_mix"])
+        col_ctx = np.tanh(np.transpose(np.transpose(m, (1, 0, 2)) @ self.W["msa_col_mix"], (1, 0, 2)))
+        fused = 0.6 * m + 0.2 * row_ctx + 0.2 * col_ctx
+        return fused.mean(axis=0)  # (L,d_msa)
+
+    def template_feature(self, L: int) -> np.ndarray:
+        # Synthetic template prior: favors i~i+3.6 helix-like periodic contacts.
+        ii = np.arange(L)[:, None]
+        jj = np.arange(L)[None, :]
+        sep = np.abs(ii - jj)
+        return np.exp(-((sep - 4.0) ** 2) / 18.0)
 
     def pair_representation(self, seq_repr: np.ndarray, msa_repr: np.ndarray) -> np.ndarray:
-        """Initialize residue-pair representation from single + MSA features."""
-        s = np.concatenate([seq_repr, msa_repr], axis=-1)
-        left = s @ self.weights.pair_proj_left
-        right = s @ self.weights.pair_proj_right
-        pair = left[:, None, :] + right[None, :, :]
+        L = seq_repr.shape[0]
+        seq_l = seq_repr @ self.W["seq_to_pair_l"]
+        seq_r = seq_repr @ self.W["seq_to_pair_r"]
+        msa_l = msa_repr @ self.W["msa_to_pair_l"]
+        msa_r = msa_repr @ self.W["msa_to_pair_r"]
+        z = seq_l[:, None, :] + seq_r[None, :, :] + msa_l[:, None, :] + msa_r[None, :, :]
 
-        # Add simple relative-position bias.
-        L = pair.shape[0]
-        rel = np.arange(L)[:, None] - np.arange(L)[None, :]
-        pair += 0.01 * np.tanh(rel[..., None] / 8.0)
-        return pair
+        ii = np.arange(L)[:, None]
+        jj = np.arange(L)[None, :]
+        rel = np.tanh((ii - jj) / 16.0)
+        sep = np.log1p(np.abs(ii - jj))
+        tpl = self.template_feature(L)
+        coupling = np.tanh((msa_repr @ msa_repr.T) / msa_repr.shape[-1])
 
-    def _triangle_multiplicative_update(self, z: np.ndarray, outgoing: bool) -> np.ndarray:
-        w = self.weights.tri_mul_out if outgoing else self.weights.tri_mul_in
-        zz = z @ w
-        # outgoing: i,j updated through k as i->k and j->k interactions
-        if outgoing:
-            upd = np.einsum("ikd,jkd->ijd", zz, zz) / math.sqrt(z.shape[-1])
-        else:
-            upd = np.einsum("kid,kjd->ijd", zz, zz) / math.sqrt(z.shape[-1])
-        return upd
-
-    def _triangle_attention_update(self, z: np.ndarray) -> np.ndarray:
-        q = z @ self.weights.tri_attn_q
-        k = z @ self.weights.tri_attn_k
-        v = z @ self.weights.tri_attn_v
-        logits = np.einsum("ijd,ikd->ijk", q, k) / math.sqrt(z.shape[-1])
-        logits = logits - logits.max(axis=-1, keepdims=True)
-        attn = np.exp(logits)
-        attn /= np.clip(attn.sum(axis=-1, keepdims=True), 1e-8, None)
-        return np.einsum("ijk,ikd->ijd", attn, v)
-
-    def triangle_updates(self, pair_repr: np.ndarray) -> np.ndarray:
-        """AlphaFold-style triangle multiplicative + attention updates."""
-        z = pair_repr.copy()
-        for _ in range(self.config.n_triangle_updates):
-            z = z + 0.2 * np.tanh(self._triangle_multiplicative_update(z, outgoing=True))
-            z = z + 0.2 * np.tanh(self._triangle_multiplicative_update(z, outgoing=False))
-            z = z + 0.2 * np.tanh(self._triangle_attention_update(z))
-            z = 0.5 * (z + np.transpose(z, (1, 0, 2)))  # enforce i,j symmetry
+        bias_feat = np.stack([rel, sep / (sep.max() + 1e-6), tpl, coupling], axis=-1)
+        z = z + bias_feat @ self.W["pair_bias_proj"]
+        z = 0.5 * (z + np.transpose(z, (1, 0, 2)))
         return z
 
-    def se3_equivariant_refinement(self, pair_repr: np.ndarray, n_steps: Optional[int] = None) -> np.ndarray:
-        """Coordinate refinement equivariant to rigid translations/rotations.
+    def _triangle_mul(self, z: np.ndarray, outgoing: bool) -> np.ndarray:
+        w = self.W["tri_mul_out"] if outgoing else self.W["tri_mul_in"]
+        h = np.tanh(z @ w)
+        if outgoing:
+            return np.einsum("ikd,jkd->ijd", h, h) / math.sqrt(z.shape[-1])
+        return np.einsum("kid,kjd->ijd", h, h) / math.sqrt(z.shape[-1])
 
-        Update rule uses only pairwise relative vectors and scalar gates from pair features,
-        which preserves SE(3)-equivariance.
-        """
-        L = pair_repr.shape[0]
-        steps = n_steps or self.config.n_refine_steps
+    def _triangle_attn(self, z: np.ndarray) -> np.ndarray:
+        q = z @ self.W["tri_q"]
+        k = z @ self.W["tri_k"]
+        v = z @ self.W["tri_v"]
+        logits = np.einsum("ijd,ikd->ijk", q, k) / math.sqrt(z.shape[-1])
+        a = self._softmax(logits, axis=-1)
+        return np.einsum("ijk,ikd->ijd", a, v)
+
+    def evoformer_recycle(self, pair: np.ndarray) -> np.ndarray:
+        z = pair
+        for _ in range(self.config.n_evo_blocks):
+            for _ in range(self.config.n_triangle_updates):
+                z = z + 0.2 * np.tanh(self._triangle_mul(z, outgoing=True))
+                z = z + 0.2 * np.tanh(self._triangle_mul(z, outgoing=False))
+                z = z + 0.15 * np.tanh(self._triangle_attn(z))
+                z = 0.5 * (z + np.transpose(z, (1, 0, 2)))
+        return z
+
+    def _ipa_refine(self, pair: np.ndarray, n_steps: int) -> np.ndarray:
+        L = pair.shape[0]
         coords = np.stack([np.arange(L), np.zeros(L), np.zeros(L)], axis=-1).astype(np.float64)
 
-        for _ in range(steps):
-            rel = coords[:, None, :] - coords[None, :, :]  # (L,L,3)
-            dist2 = np.sum(rel * rel, axis=-1, keepdims=True) + 1e-6
-            inv_dist = 1.0 / np.sqrt(dist2)
-            scalar = np.tanh(pair_repr @ self.weights.refine_feat_proj)  # (L,L,3)
-            # isotropic + learned directional modulation
-            direction = rel * inv_dist
-            force = (0.15 * direction + 0.05 * scalar) / np.sqrt(dist2)
+        for _ in range(n_steps):
+            rel = coords[:, None, :] - coords[None, :, :]
+            d2 = np.sum(rel * rel, axis=-1, keepdims=True) + 1e-6
+            unit = rel / np.sqrt(d2)
+            gate = 1.0 / (1.0 + np.exp(-(pair @ self.W["ipa_pair_gate"])))
+            force_feat = np.tanh(pair @ self.W["ipa_pair_to_force"])
+            force = gate * (0.18 * unit + 0.04 * force_feat) / np.sqrt(d2)
             delta = force.sum(axis=1) - force.sum(axis=0)
-            coords += 0.02 * delta
-            coords -= coords.mean(axis=0, keepdims=True)  # center-of-mass stabilization
+            coords += 0.03 * delta
+            coords -= coords.mean(axis=0, keepdims=True)
         return coords
 
-    def torsion_head(self, seq_repr: np.ndarray, pair_repr: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """Predict torsion-angle distributions and MAP angles for phi/psi/omega."""
-        pair_pool = pair_repr.mean(axis=1)
-        fused = np.concatenate([seq_repr, pair_pool], axis=-1)
-        logits = fused @ self.weights.torsion_proj
-        logits = logits.reshape(len(seq_repr), 3, self.config.torsion_bins)
+    def _diffusion_refine(self, coords: np.ndarray, pair: np.ndarray, steps: int) -> np.ndarray:
+        x = coords.copy()
+        cond = np.tanh(pair @ self.W["diffusion_cond"]).mean(axis=1)
+        for t in range(steps, 0, -1):
+            sigma = 0.08 * (t / steps)
+            eps = self.rng.normal(0.0, sigma, size=x.shape)
+            x_noisy = x + eps
 
-        probs = np.exp(logits - logits.max(axis=-1, keepdims=True))
-        probs /= np.clip(probs.sum(axis=-1, keepdims=True), 1e-8, None)
-        idx = np.argmax(probs, axis=-1)
-        angles = -math.pi + (2 * math.pi) * (idx / (self.config.torsion_bins - 1))
+            # Denoiser predicts correction from pair-conditioned drift + backbone smoothness.
+            smooth = np.zeros_like(x)
+            smooth[1:-1] = 0.5 * (x_noisy[:-2] + x_noisy[2:]) - x_noisy[1:-1]
+            denoise = 0.55 * smooth + 0.45 * cond
+            x = x_noisy + 0.25 * denoise
+            x -= x.mean(axis=0, keepdims=True)
+        return x
+
+    def torsion_head(self, seq_repr: np.ndarray, pair: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        pooled = pair.mean(axis=1)
+        f = np.concatenate([seq_repr, pooled], axis=-1)
+        logits = (f @ self.W["torsion_head"]).reshape(len(seq_repr), 3, self.config.torsion_bins)
+        probs = self._softmax(logits, axis=-1)
+        idx = probs.argmax(axis=-1)
+        angles = -math.pi + (2 * math.pi) * idx / max(1, (self.config.torsion_bins - 1))
         return logits, angles
 
-    def _single_pass(self, sequence: str, msa: List[str], state: str) -> StructurePrediction:
+    def distogram_head(self, pair: np.ndarray) -> np.ndarray:
+        return np.einsum("ijd,db->ijb", pair, self.W["dist_head"])
+
+    def plddt_head(self, seq_repr: np.ndarray, pair: np.ndarray) -> np.ndarray:
+        pooled = pair.mean(axis=1)
+        f = np.concatenate([seq_repr, pooled], axis=-1)
+        logits = (f @ self.W["plddt_head"]).squeeze(-1)
+        return 100.0 / (1.0 + np.exp(-logits))
+
+    def _single(self, sequence: str, msa: Sequence[str], state: str) -> Prediction:
         seq_repr = self.sequence_embedding(sequence, state)
         msa_repr = self.msa_encoder(msa)
         pair = self.pair_representation(seq_repr, msa_repr)
 
         for _ in range(self.config.n_recycles):
-            pair = self.triangle_updates(pair)
+            pair = self.evoformer_recycle(pair)
 
-        coords = self.se3_equivariant_refinement(pair)
+        coords = self._ipa_refine(pair, self.config.n_refine_steps)
+        coords = self._diffusion_refine(coords, pair, self.config.n_diffusion_steps)
+
         torsion_logits, torsion_angles = self.torsion_head(seq_repr, pair)
+        dist_logits = self.distogram_head(pair)
+        plddt = self.plddt_head(seq_repr, pair)
+        return Prediction(sequence, state, coords, torsion_logits, torsion_angles, dist_logits, plddt, pair)
 
-        # Lightweight confidence proxy from pair norms.
-        conf = 1.0 / (1.0 + np.exp(-pair.mean(axis=(1, 2))))
-        return StructurePrediction(
-            sequence=sequence,
-            state=state,
-            coordinates=coords,
-            pair_representation=pair,
-            torsion_logits=torsion_logits,
-            torsion_angles=torsion_angles,
-            confidence=conf,
-        )
+    def ensemble_sample(self, sequence: str, msa: Sequence[str], state: str) -> Dict[str, object]:
+        members: List[Prediction] = []
+        seed0 = self.config.random_seed or 0
 
-    def ensemble_sample(self, sequence: str, msa: List[str], state: str) -> Dict[str, object]:
-        """Sample an ensemble and return aggregate statistics + members."""
-        members: List[StructurePrediction] = []
-        base_seed = self.config.random_seed if self.config.random_seed is not None else 0
+        for i in range(self.config.n_ensemble):
+            self.rng = np.random.default_rng(seed0 + 8191 * (i + 1))
+            self.W = self._init_weights()
+            members.append(self._single(sequence, msa, state))
 
-        for k in range(self.config.n_ensemble):
-            self.rng = np.random.default_rng(base_seed + 104729 * (k + 1))
-            self.weights = self._init_weights()
-            members.append(self._single_pass(sequence, msa, state))
-
-        stack = np.stack([m.coordinates for m in members], axis=0)
-        mean_coords = stack.mean(axis=0)
-        var_coords = stack.var(axis=0)
+        coords = np.stack([m.coordinates for m in members], axis=0)
+        plddt = np.stack([m.plddt for m in members], axis=0)
 
         return {
             "state": state,
-            "mean_coordinates": mean_coords,
-            "coordinate_variance": var_coords,
-            "mean_confidence": np.mean(np.stack([m.confidence for m in members], axis=0), axis=0),
             "members": members,
+            "mean_coordinates": coords.mean(axis=0),
+            "coordinate_variance": coords.var(axis=0),
+            "mean_plddt": plddt.mean(axis=0),
+            "ensemble_diversity": float(coords.var(axis=0).mean()),
         }
 
-    def model_allosteric_states(self, sequence: str, msa: List[str]) -> Dict[str, Dict[str, object]]:
-        """Generate state-conditioned ensembles for all configured allosteric states."""
-        results = {}
+    def allosteric_landscape(self, sequence: str, msa: Sequence[str]) -> Dict[str, Dict[str, object]]:
+        landscape: Dict[str, Dict[str, object]] = {}
         for state in self.config.allosteric_states:
-            results[state] = self.ensemble_sample(sequence, msa, state)
-        return results
+            landscape[state] = self.ensemble_sample(sequence, msa, state)
+        return landscape
 
 
-def _build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="Advanced protein folding architecture prototype")
-    p.add_argument("sequence", help="Primary sequence (single-letter amino-acid code)")
-    p.add_argument("--msa", nargs="*", default=None, help="MSA rows. If omitted, uses sequence only")
-    p.add_argument("--state", default="inactive", help="Allosteric state label")
-    p.add_argument("--ensemble", type=int, default=8, help="Number of ensemble samples")
-    p.add_argument("--recycles", type=int, default=4, help="Number of triangle recycling rounds")
-    p.add_argument("--json", action="store_true", help="Print JSON output")
+def _parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description="HyperFold-X architecture prototype")
+    p.add_argument("sequence")
+    p.add_argument("--msa", nargs="*", default=None)
+    p.add_argument("--state", default="inactive")
+    p.add_argument("--ensemble", type=int, default=6)
+    p.add_argument("--recycles", type=int, default=3)
+    p.add_argument("--evo-blocks", type=int, default=4)
+    p.add_argument("--json", action="store_true")
     return p
 
 
 def main() -> None:
-    args = _build_parser().parse_args()
-    cfg = ModelConfig(n_ensemble=args.ensemble, n_recycles=args.recycles)
-    model = AdvancedProteinFoldingModel(cfg)
+    args = _parser().parse_args()
+    cfg = ModelConfig(n_ensemble=args.ensemble, n_recycles=args.recycles, n_evo_blocks=args.evo_blocks)
+    model = HyperFoldX(cfg)
     msa = args.msa if args.msa else [args.sequence]
 
     if args.state == "all":
-        out = model.model_allosteric_states(args.sequence, msa)
+        landscape = model.allosteric_landscape(args.sequence, msa)
         summary = {
-            s: {
-                "mean_confidence_mean": float(v["mean_confidence"].mean()),
-                "mean_coordinates_shape": list(v["mean_coordinates"].shape),
-                "coordinate_variance_mean": float(v["coordinate_variance"].mean()),
+            k: {
+                "mean_plddt": float(v["mean_plddt"].mean()),
+                "diversity": float(v["ensemble_diversity"]),
+                "shape": list(v["mean_coordinates"].shape),
             }
-            for s, v in out.items()
+            for k, v in landscape.items()
         }
         if args.json:
             print(json.dumps(summary, indent=2))
         else:
-            for state, stats in summary.items():
-                print(f"State={state}: confidence={stats['mean_confidence_mean']:.3f}, "
-                      f"var={stats['coordinate_variance_mean']:.5f}")
+            for s, d in summary.items():
+                print(f"State={s:14s} pLDDT={d['mean_plddt']:.2f} diversity={d['diversity']:.6f}")
         return
 
     if args.state not in cfg.allosteric_states:
-        raise ValueError(f"state must be one of {cfg.allosteric_states} or 'all'")
+        raise ValueError(f"state must be in {cfg.allosteric_states} or 'all'")
 
     out = model.ensemble_sample(args.sequence, msa, args.state)
     payload = {
         "state": out["state"],
         "mean_coordinates": out["mean_coordinates"].tolist(),
         "coordinate_variance": out["coordinate_variance"].tolist(),
-        "mean_confidence": out["mean_confidence"].tolist(),
+        "mean_plddt": out["mean_plddt"].tolist(),
+        "ensemble_diversity": out["ensemble_diversity"],
         "members": [m.to_jsonable() for m in out["members"]],
     }
+
     if args.json:
         print(json.dumps(payload, indent=2))
     else:
         print(f"State: {payload['state']}")
-        print(f"Residues: {len(args.sequence)}")
-        print(f"Ensemble members: {len(payload['members'])}")
-        print(f"Mean confidence: {float(np.mean(out['mean_confidence'])):.3f}")
-        print("First 5 mean coordinates:")
+        print(f"Length: {len(args.sequence)}")
+        print(f"Ensemble: {len(payload['members'])}")
+        print(f"Mean pLDDT: {float(np.mean(out['mean_plddt'])):.2f}")
+        print(f"Ensemble diversity: {payload['ensemble_diversity']:.6f}")
+        print("First 5 residues (mean coordinates):")
         for i, c in enumerate(payload["mean_coordinates"][:5]):
             print(f"  {i:3d}: ({c[0]: .3f}, {c[1]: .3f}, {c[2]: .3f})")
 

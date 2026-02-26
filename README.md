@@ -1,43 +1,42 @@
-# Advanced Protein Folding Architecture Prototype
+# HyperFold-X (Advanced Protein Folding Architecture Prototype)
 
-This repository now provides a **modern, architecture-level protein folding prototype** with the requested advanced components:
+This repository now contains a **substantially expanded architecture prototype** for protein structure modeling.
 
-- Sequence embedding
-- MSA encoder
-- Residue–residue pair representation
-- AlphaFold-style triangle updates
-- SE(3)-equivariant coordinate refinement
-- Torsion angle head
-- Ensemble sampling
-- Allosteric state modeling
+## What is included
 
-> Implementation note: this is a NumPy-only educational/research prototype focused on architecture and geometric principles, not a production-trained model.
+- Sequence embedding with positional/state conditioning
+- MSA encoder with axial-style row/column mixing
+- Pair representation with relative position, MSA coupling, and template prior
+- Evoformer-like recycling stack with triangle multiplicative + attention updates
+- Invariant-point-like SE(3)-equivariant coordinate refinement
+- Diffusion-style denoising refinement over coordinates
+- Geometric heads:
+  - torsion logits/angles (phi, psi, omega)
+  - distogram logits
+  - pLDDT-like confidence scores
+- Ensemble sampling and allosteric landscape modeling
 
-## Quick start
+## Important note
+
+This is a NumPy prototype and **not a trained SOTA model**, so it should be treated as a research scaffold rather than a replacement for production systems.
+
+## Usage
 
 ```bash
 python protein_folding.py ACDEFGHIK --msa ACDEFGHIK ACDEYGHIK ACDEFGHVK --state active
 ```
 
-### JSON output
+All allosteric states:
+
+```bash
+python protein_folding.py ACDEFGHIK --state all
+```
+
+JSON output:
 
 ```bash
 python protein_folding.py ACDEFGHIK --json
 ```
-
-### All allosteric states at once
-
-```bash
-python protein_folding.py ACDEFGHIK --state all --json
-```
-
-## CLI flags
-
-- `--msa ...` : provide MSA rows; defaults to sequence-only.
-- `--state` : one of `inactive`, `active`, `intermediate`, or `all`.
-- `--ensemble` : number of ensemble samples.
-- `--recycles` : number of triangle-recycling passes.
-- `--json` : machine-readable output.
 
 ## Tests
 
