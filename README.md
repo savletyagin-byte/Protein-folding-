@@ -1,24 +1,42 @@
-# HyperFold-X (Advanced Protein Folding Architecture Prototype)
+# OmegaFold-Prototype-X (Maximum-Feature Protein Folding Prototype)
 
-This repository now contains a **substantially expanded architecture prototype** for protein structure modeling.
+This repository now ships a **maximal NumPy-based architecture prototype** that packs many modern ideas into one scaffold.
 
-## What is included
+## Included modules
 
-- Sequence embedding with positional/state conditioning
-- MSA encoder with axial-style row/column mixing
-- Pair representation with relative position, MSA coupling, and template prior
-- Evoformer-like recycling stack with triangle multiplicative + attention updates
-- Invariant-point-like SE(3)-equivariant coordinate refinement
-- Diffusion-style denoising refinement over coordinates
-- Geometric heads:
-  - torsion logits/angles (phi, psi, omega)
+- Sequence embedding
+  - token + position + biochemical channels + allosteric state conditioning
+- MSA encoder
+  - axial-style row/column mixing
+  - MSA dropout for ensemble diversity
+  - coupling extraction
+- Pair representation
+  - sequence/MSA fusion
+  - relative-position + inverse-separation bias
+  - template prior + contact prior + coupling priors
+- Evoformer-like structural core
+  - triangle multiplicative (incoming/outgoing)
+  - triangle attention
+  - recycling with early stopping
+- Geometry refinement
+  - IPA-like SE(3)-equivariant coordinate updates
+  - diffusion-like denoising refinement
+- Heads
+  - torsion angle logits + decoded angles
   - distogram logits
-  - pLDDT-like confidence scores
-- Ensemble sampling and allosteric landscape modeling
+  - pLDDT-like confidence
+  - PAE-like pairwise aligned error
+- Quality and ranking
+  - clash/bond/compactness quality metrics
+  - ranking score over confidence + physical plausibility + diversity
+- Sampling and state-space
+  - ensemble sampling
+  - consensus statistics
+  - allosteric landscape generation across states
 
 ## Important note
 
-This is a NumPy prototype and **not a trained SOTA model**, so it should be treated as a research scaffold rather than a replacement for production systems.
+This is still an educational/research prototype (no trained weights), so it is intended for experimentation and architecture exploration.
 
 ## Usage
 
@@ -26,7 +44,7 @@ This is a NumPy prototype and **not a trained SOTA model**, so it should be trea
 python protein_folding.py ACDEFGHIK --msa ACDEFGHIK ACDEYGHIK ACDEFGHVK --state active
 ```
 
-All allosteric states:
+All states:
 
 ```bash
 python protein_folding.py ACDEFGHIK --state all
