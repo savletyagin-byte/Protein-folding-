@@ -1,42 +1,43 @@
-# OmegaFold-Prototype-X (Maximum-Feature Protein Folding Prototype)
+# OmegaFold-Ultra (Most-Advanced NumPy Protein Folding Prototype)
 
-This repository now ships a **maximal NumPy-based architecture prototype** that packs many modern ideas into one scaffold.
+This repository contains an expanded **OmegaFold-Ultra** research scaffold with a very broad feature set.
 
-## Included modules
+## What’s included
 
 - Sequence embedding
-  - token + position + biochemical channels + allosteric state conditioning
+  - token + positional + biochemical channels
+  - allosteric-state conditioning
 - MSA encoder
-  - axial-style row/column mixing
-  - MSA dropout for ensemble diversity
-  - coupling extraction
+  - axial row/column mixing
+  - stochastic MSA dropout
+  - coupling-map extraction
 - Pair representation
   - sequence/MSA fusion
-  - relative-position + inverse-separation bias
-  - template prior + contact prior + coupling priors
-- Evoformer-like structural core
-  - triangle multiplicative (incoming/outgoing)
-  - triangle attention
-  - recycling with early stopping
-- Geometry refinement
-  - IPA-like SE(3)-equivariant coordinate updates
+  - relative/log/inverse separation priors
+  - template/contact/band priors and coupling priors
+- Structural core
+  - triangle multiplicative + triangle attention updates
+  - recycling with convergence criterion
+- Geometry stack
+  - IPA-like SE(3)-equivariant refinement
   - diffusion-like denoising refinement
-- Heads
-  - torsion angle logits + decoded angles
+  - annealing-based relaxation
+- Prediction heads
+  - torsion logits + decoded angles
   - distogram logits
   - pLDDT-like confidence
-  - PAE-like pairwise aligned error
-- Quality and ranking
-  - clash/bond/compactness quality metrics
-  - ranking score over confidence + physical plausibility + diversity
-- Sampling and state-space
-  - ensemble sampling
-  - consensus statistics
-  - allosteric landscape generation across states
+  - PAE-like matrix
+- Post-processing
+  - uncertainty calibration
+  - physical quality metrics (clash/bond/Rg/compactness)
+  - self-consistency score
+  - ensemble ranking and consensus
+- State-space analysis
+  - allosteric landscape generation across configured states
 
 ## Important note
 
-This is still an educational/research prototype (no trained weights), so it is intended for experimentation and architecture exploration.
+This remains a NumPy research prototype with random initialization and no learned weights.
 
 ## Usage
 
