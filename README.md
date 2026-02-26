@@ -1,47 +1,43 @@
-# Trainable Protein Folding Prototype (Autograd + BioPython)
+# Advanced Trainable Protein Folding Prototype (Autograd + BioPython)
 
-This project now uses **more than NumPy**:
-- **BioPython** for real PDB structure ingestion/parsing
-- **Autograd** for differentiable training and gradient-based optimization
+This project provides a trainable real-structure prototype with a stronger optimization/evaluation stack.
 
-## What this adds
+## Advanced capabilities
 
-- Real-data training pipeline from:
+- Real PDB ingestion via BioPython:
   - local PDB files
-  - RCSB PDB IDs (download + parse)
-- Trainable model that predicts:
-  - C-alpha coordinates
-  - torsion logits
-  - distogram logits
-  - confidence scores
-- CLI for train + infer workflows
+  - RCSB PDB IDs (network permitting)
+- Differentiable training with Autograd
+- **Adam optimizer** with:
+  - weight decay
+  - gradient clipping
+  - validation split
+  - early stopping + best-checkpoint restoration
+- Multi-objective supervision:
+  - coordinate regression
+  - distogram supervision
+  - bond-length regularization
+  - confidence regularization
+- Structural evaluation metrics:
+  - Kabsch-aligned RMSD
+  - contact precision
+- Ensemble inference (`predict_ensemble`) with coordinate variance outputs
+- JSON/NPZ model save/load support
 
-## Train on real PDB IDs + infer
+## Training + inference
 
 ```bash
 python protein_folding.py ACDEFGHIK \
-  --train-pdb-ids 1ubq 1crn \
-  --epochs 10 --batch-size 2 --lr 0.01
+  --train-pdb-files data/sample_train.pdb \
+  --epochs 20 --batch-size 2 --lr 0.005 \
+  --val-split 0.2 --patience 6 \
+  --save-model trained_models/demo.json
 ```
 
-## Train on local PDB files
+## Ensemble inference
 
 ```bash
-python protein_folding.py ACDEFGHIK \
-  --train-pdb-files ./data/1ubq.pdb ./data/1crn.pdb
-```
-
-## Inference only
-
-```bash
-python protein_folding.py ACDEFGHIK
-```
-
-## Save and load trained weights
-
-```bash
-python protein_folding.py ACDEFGHIK --train-pdb-files ./data/1ubq.pdb --save-model ./trained_models/demo.json
-python protein_folding.py ACDEFGHIK --load-model ./trained_models/demo.json
+python protein_folding.py ACDEFGHIK --load-model trained_models/demo.json --ensemble-size 8 --json
 ```
 
 ## Tests
@@ -52,31 +48,6 @@ pytest -q
 
 ## Notes
 
-- This remains a compact prototype and not a production-grade, benchmarked system.
-- RCSB download success depends on network availability.
-
-
-- Note: binary model artifacts are not committed. Use JSON checkpoints (`.json`) for branch-friendly text artifacts.
-
-
-## Branch update fix
-
-If your host rejects branch updates due to binary files, run:
-
-```bash
-./scripts/ensure_no_binary_history.sh
-```
-
-Then force-push the rewritten branch history:
-
-```bash
-git push --force-with-lease origin <your-branch-name>
-```
-
-See `BRANCH_UPDATE_FIX.md` for details.
-
-
-For persistent remote errors, run `./scripts/repair_binary_history.sh` then force-push.
-
-
-If remote checks still fail, create a clean snapshot branch with `./scripts/create_clean_branch_snapshot.sh <branch>` and open a new PR from it.
+- This is still a compact prototype (not production-scale SOTA).
+- Binary model artifacts should remain untracked.
+- If your host reports binary-history branch issues, see `BRANCH_UPDATE_FIX.md`.

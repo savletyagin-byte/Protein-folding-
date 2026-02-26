@@ -28,19 +28,34 @@ def test_local_pdb_dataset_parsing(tmp_path: Path):
     assert ex.coords.shape == (6, 3)
 
 
-def test_training_loop_runs_on_real_pdb_example(tmp_path: Path):
+def test_fit_and_evaluate_run_on_real_pdb_example(tmp_path: Path):
     pdb_file = tmp_path / "mini.pdb"
     pdb_file.write_text(PDB_TEXT)
 
     ds = RealStructureDataset.from_local_pdbs([str(pdb_file)], min_len=5)
-    model = TrainableProteinModel(ModelConfig(epochs=3, batch_size=1, lr=5e-3, d_hidden=32, torsion_bins=16, dist_bins=16))
-    history = model.train(ds)
+    model = TrainableProteinModel(
+        ModelConfig(
+            epochs=3,
+            batch_size=1,
+            lr=5e-3,
+            d_hidden=32,
+            torsion_bins=16,
+            dist_bins=16,
+            val_split=0.5,
+            early_stopping_patience=2,
+        )
+    )
+    result = model.fit(ds)
 
-    assert len(history) == 3
-    assert np.isfinite(history[-1])
+    assert result.epochs_ran >= 1
+    assert np.isfinite(result.best_val_loss)
+
+    metrics = model.evaluate(ds)
+    assert set(metrics.keys()) == {"loss", "rmsd", "contact_precision"}
+    assert np.isfinite(metrics["loss"])
 
 
-def test_predict_shapes():
+def test_predict_shapes_and_ensemble_outputs():
     model = TrainableProteinModel(ModelConfig(d_hidden=32, torsion_bins=18, dist_bins=20))
     pred = model.predict("ACDEFG")
 
@@ -50,10 +65,16 @@ def test_predict_shapes():
     assert pred.confidence.shape == (6,)
     assert np.all((pred.confidence >= 0) & (pred.confidence <= 100))
 
+    ens = model.predict_ensemble("ACDEFG", n_members=3)
+    assert ens["mean_coords"].shape == (6, 3)
+    assert ens["coord_var"].shape == (6, 3)
+    assert ens["mean_confidence"].shape == (6,)
+    assert ens["members"] == 3
+
 
 def test_save_and_load_roundtrip(tmp_path: Path):
     model = TrainableProteinModel(ModelConfig(d_hidden=16, torsion_bins=12, dist_bins=12))
-    out_path = tmp_path / "weights.npz"
+    out_path = tmp_path / "weights.json"
     model.save(str(out_path))
 
     model2 = TrainableProteinModel(ModelConfig(d_hidden=16, torsion_bins=12, dist_bins=12))
