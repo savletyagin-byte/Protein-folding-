@@ -58,3 +58,13 @@ pytest -q
 - This is still a compact prototype and not a production-scale benchmarked foundation model.
 - Keep binary model artifacts untracked.
 - For binary-history branch issues, see `BRANCH_UPDATE_FIX.md`.
+
+## One-command "do it for me" run
+
+If you want the full flow automated (install deps, train on included sample, then run ensemble inference):
+
+```bash
+./scripts/run_demo.sh
+```
+
+This writes a JSON checkpoint to `trained_models/demo.json`.
