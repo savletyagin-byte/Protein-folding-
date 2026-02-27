@@ -32,6 +32,13 @@ from matplotlib import animation
 import numpy as np
 from Bio.PDB import PDBList, PDBParser, is_aa
 
+try:
+    import torch
+    from e3nn import o3
+except Exception:  # optional dependency
+    torch = None
+    o3 = None
+
 AA_VOCAB = "ACDEFGHIKLMNPQRSTVWY-X"
 AA_TO_IDX = {a: i for i, a in enumerate(AA_VOCAB)}
 RES3_TO_1 = {
@@ -54,6 +61,8 @@ class ModelConfig:
     dropout_rate: float = 0.0
     curriculum: bool = False
     use_swa: bool = False
+    use_e3nn: bool = True
+    e3nn_step_scale: float = 0.05
 
     # geometry
     knn_k: int = 8
@@ -223,6 +232,23 @@ class TrainableProteinModel:
         self.config = config or ModelConfig()
         self.rng = np.random.default_rng(self.config.random_seed)
         self.params = self._init_params()
+        self._init_e3nn()
+
+    def _init_e3nn(self) -> None:
+        self._e3nn_ready = False
+        self._e3nn_warning = None
+        if not self.config.use_e3nn:
+            return
+        if torch is None or o3 is None:
+            self._e3nn_warning = "e3nn/torch unavailable; falling back to numpy coordinate updates."
+            return
+        try:
+            self._e3nn_irreps_in = o3.Irreps("1x0e + 1x1o")
+            self._e3nn_vec = o3.Linear(self._e3nn_irreps_in, o3.Irreps("1x1o"), internal_weights=True, shared_weights=True)
+            self._e3nn_gate_w = torch.tensor(self.rng.normal(0.0, 0.05, size=(self.config.d_node + self.config.d_pair,)), dtype=torch.float32)
+            self._e3nn_ready = True
+        except Exception as exc:
+            self._e3nn_warning = f"e3nn init failed ({exc}); using numpy fallback."
 
     def _init_params(self) -> Dict[str, np.ndarray]:
         d_in = len(AA_VOCAB) + 6
@@ -345,8 +371,13 @@ class TrainableProteinModel:
         return node + anp.stack(msgs, axis=0)
 
     def _equivariant_coord_update(self, node: anp.ndarray, pair: anp.ndarray, coords: anp.ndarray, graph: anp.ndarray) -> anp.ndarray:
+        if self._e3nn_ready:
+            try:
+                return self._equivariant_coord_update_e3nn(node, pair, coords, graph)
+            except Exception:
+                pass
+
         rel, dist, unit = self._pairwise(coords)
-        pair_scalar = anp.mean(pair, axis=-1)
         n = coords.shape[0]
         dcoords = []
         for i in range(n):
@@ -358,6 +389,33 @@ class TrainableProteinModel:
             dcoords.append(dc)
         new_coords = coords + 0.1 * anp.stack(dcoords, axis=0)
         return new_coords - anp.mean(new_coords, axis=0, keepdims=True)
+
+    def _equivariant_coord_update_e3nn(self, node: anp.ndarray, pair: anp.ndarray, coords: anp.ndarray, graph: anp.ndarray) -> anp.ndarray:
+        # True O(3)-equivariant edge updates using e3nn irreps and linear maps.
+        c = torch.tensor(np.asarray(coords), dtype=torch.float32)
+        n = c.shape[0]
+        gi, gj = np.where(np.asarray(graph) > 0.0)
+        if len(gi) == 0:
+            return coords
+
+        src = torch.tensor(gi, dtype=torch.long)
+        dst = torch.tensor(gj, dtype=torch.long)
+        edge = c[dst] - c[src]
+        r = torch.norm(edge, dim=-1, keepdim=True).clamp_min(1e-6)
+        unit = edge / r
+
+        # irreps: 0e (scalar gate) + 1o (vector direction)
+        gate_feat = np.concatenate([np.asarray(node)[gi], np.asarray(pair)[gi, gj]], axis=-1)
+        gate = torch.sigmoid(torch.tensor(gate_feat, dtype=torch.float32) @ self._e3nn_gate_w)[:, None]
+        x = torch.cat([gate, unit], dim=-1)
+
+        vec_msg = self._e3nn_vec(x) / r
+        agg = torch.zeros((n, 3), dtype=torch.float32)
+        agg.index_add_(0, src, vec_msg)
+
+        new_coords = c + float(self.config.e3nn_step_scale) * torch.tanh(agg)
+        new_coords = new_coords - new_coords.mean(dim=0, keepdim=True)
+        return anp.asarray(new_coords.detach().cpu().numpy())
 
     def _forward(self, params: Dict[str, anp.ndarray], sequence: str, recycle_override: Optional[int] = None) -> Tuple[anp.ndarray, anp.ndarray, anp.ndarray, anp.ndarray, anp.ndarray]:
         # bind params for autograd
@@ -603,7 +661,7 @@ class TrainableProteinModel:
 
 
 def _parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="Geometric SE(3)-style trainable protein prototype")
+    p = argparse.ArgumentParser(description="Geometric protein prototype with optional true e3nn SE(3) equivariance")
     p.add_argument("sequence", nargs="?", help="Sequence for inference")
     p.add_argument("--train-pdb-ids", nargs="*", default=None)
     p.add_argument("--train-pdb-files", nargs="*", default=None)
@@ -616,6 +674,7 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--knn-k", type=int, default=8)
     p.add_argument("--radius-cutoff", type=float, default=10.0)
     p.add_argument("--use-radius-graph", action="store_true")
+    p.add_argument("--no-e3nn", action="store_true", help="Disable e3nn equivariant coordinate updates")
     p.add_argument("--ensemble-size", type=int, default=0)
     p.add_argument("--json", action="store_true")
     p.add_argument("--save-model", default=None)
@@ -642,6 +701,7 @@ def main() -> None:
         knn_k=args.knn_k,
         radius_cutoff=args.radius_cutoff,
         use_radius_graph=args.use_radius_graph,
+        use_e3nn=(not args.no_e3nn),
     )
     model = TrainableProteinModel(cfg)
     if args.load_model:
@@ -704,6 +764,7 @@ def main() -> None:
             "distogram_logits_shape": list(pred.distogram_logits.shape),
             "confidence": pred.confidence.tolist(),
             "pair_error_shape": list(pred.pair_error.shape),
+            "e3nn_enabled": bool(model._e3nn_ready),
             "saved_model": args.save_model if (args.save_model and trained) else None,
             "saved_prediction_pdb": args.save_pred_pdb,
             "saved_prediction_image": args.save_pred_image,

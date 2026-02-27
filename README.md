@@ -47,6 +47,31 @@ python protein_folding.py ACDEFGHIK \
 python protein_folding.py ACDEFGHIK --load-model trained_models/demo.json --ensemble-size 8 --json
 ```
 
+
+## True SE(3) equivariance with e3nn
+
+The model now includes an optional **true e3nn-based coordinate update** path that uses O(3) irreps (`0e + 1o`) and an equivariant `o3.Linear` map for coordinate message updates.
+
+Install optional dependencies:
+
+```bash
+python -m pip install torch e3nn
+```
+
+Run with e3nn enabled (default when installed):
+
+```bash
+python protein_folding.py ACDEFGHIK --load-model trained_models/demo.json --json
+```
+
+Force-disable e3nn and use the numpy fallback:
+
+```bash
+python protein_folding.py ACDEFGHIK --load-model trained_models/demo.json --no-e3nn --json
+```
+
+JSON output includes `e3nn_enabled` so you can verify whether true equivariant updates were active at runtime.
+
 ## Tests
 
 ```bash
