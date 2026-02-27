@@ -1,16 +1,15 @@
-"""Ultra-advanced trainable protein-structure prototype with real PDB ingestion.
+"""Geometric protein folding prototype with equivariant recycling.
 
-Advanced stack highlights:
-- BioPython real PDB ingestion (local + RCSB).
-- Autograd differentiable model with residual MLP blocks.
-- Adam + cosine LR schedule + warmup + gradient clipping + weight decay.
-- Curriculum batching by sequence length.
-- EMA (exponential moving average) weights.
-- SWA-like parameter averaging in final epochs.
-- Validation split + early stopping + best-weights restoration.
-- Structural metrics: Kabsch RMSD, contact precision/recall/F1, MAE distance.
-- Uncertainty-aware ensemble + MC-dropout-style stochastic inference.
-- JSON/NPZ checkpoint save/load with metadata.
+Implements (compactly):
+- Residue graphs (kNN / radius)
+- Node + pair embeddings and message passing
+- Long-range attention
+- SE(3)-equivariant style updates using spherical-harmonic-inspired features
+- Pair triangle updates (multiplicative + attention-like)
+- Iterative recycling of structure/representations
+- Multi-loss training: FAPE-like, distogram CE, torsion, lDDT-like, clash, bond
+- Confidence heads: pLDDT-like and pairwise error (PAE-like)
+- Visualization exports: single view, multiview, rotation GIF
 """
 
 from __future__ import annotations
@@ -26,11 +25,11 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import autograd.numpy as anp
 from autograd import grad
-import numpy as np
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib import animation
+import numpy as np
 from Bio.PDB import PDBList, PDBParser, is_aa
 
 AA_VOCAB = "ACDEFGHIKLMNPQRSTVWY-X"
@@ -40,47 +39,48 @@ RES3_TO_1 = {
     "HIS": "H", "ILE": "I", "LEU": "L", "LYS": "K", "MET": "M", "PHE": "F", "PRO": "P", "SER": "S",
     "THR": "T", "TRP": "W", "TYR": "Y", "VAL": "V",
 }
+RES1_TO_3 = {v: k for k, v in RES3_TO_1.items()}
+RES1_TO_3.update({"X": "UNK", "-": "GLY"})
 
-
-
-RES1_TO_3 = {
-    "A": "ALA", "R": "ARG", "N": "ASN", "D": "ASP", "C": "CYS", "Q": "GLN", "E": "GLU", "G": "GLY",
-    "H": "HIS", "I": "ILE", "L": "LEU", "K": "LYS", "M": "MET", "F": "PHE", "P": "PRO", "S": "SER",
-    "T": "THR", "W": "TRP", "Y": "TYR", "V": "VAL", "X": "UNK", "-": "GLY",
-}
 
 @dataclass
 class ModelConfig:
-    d_hidden: int = 160
+    # backwards-compatible alias used by existing tests/callers
+    d_hidden: Optional[int] = None
+    d_node: int = 128
+    d_pair: int = 64
     torsion_bins: int = 36
     dist_bins: int = 32
-    lr: float = 8e-3
-    epochs: int = 30
-    batch_size: int = 4
-    random_seed: int = 7
+    dropout_rate: float = 0.0
+    curriculum: bool = False
+    use_swa: bool = False
 
-    # optimization
+    # geometry
+    knn_k: int = 8
+    radius_cutoff: float = 10.0
+    use_radius_graph: bool = False
+
+    # trunk
+    n_message_layers: int = 2
+    n_triangle_layers: int = 2
+    n_recycles: int = 4
+
+    # train
+    lr: float = 5e-3
+    epochs: int = 20
+    batch_size: int = 2
+    random_seed: int = 7
     weight_decay: float = 1e-5
     grad_clip_norm: float = 5.0
-    warmup_epochs: int = 3
-    min_lr_ratio: float = 0.15
-
-    # regularization / stochasticity
-    dropout_rate: float = 0.10
-    augment_noise_std: float = 0.02
-
-    # data split & stopping
     val_split: float = 0.2
-    early_stopping_patience: int = 8
+    early_stopping_patience: int = 6
 
-    # advanced optimization heads
-    ema_decay: float = 0.995
-    use_ema_for_eval: bool = True
-    swa_start_ratio: float = 0.75
-    use_swa: bool = True
-
-    # curriculum
-    curriculum: bool = True
+    def __post_init__(self) -> None:
+        if self.d_hidden is not None:
+            self.d_node = int(self.d_hidden)
+            # keep pair width proportional unless explicitly overridden
+            if self.d_pair == 64:
+                self.d_pair = max(8, int(self.d_hidden) // 2)
 
 
 @dataclass
@@ -97,100 +97,28 @@ class Prediction:
     torsion_logits: np.ndarray
     distogram_logits: np.ndarray
     confidence: np.ndarray
+    pair_error: np.ndarray
 
     def to_pdb(self, chain_id: str = "A") -> str:
         lines = []
         for i, (aa, c) in enumerate(zip(self.sequence, self.coords), start=1):
             resname = RES1_TO_3.get(aa, "UNK")
-            x, y, z = float(c[0]), float(c[1]), float(c[2])
-            line = (
+            x, y, z = map(float, c)
+            lines.append(
                 f"ATOM  {i:5d}  CA  {resname:>3s} {chain_id}{i:4d}    "
                 f"{x:8.3f}{y:8.3f}{z:8.3f}  1.00 20.00           C"
             )
-            lines.append(line)
-        lines.append("TER")
-        lines.append("END")
-        return "\n".join(lines) + "\n"
-
-
-
-
-def save_structure_image(coords: np.ndarray, out_path: str, title: str = "Predicted Protein") -> None:
-    out = Path(out_path)
-    out.parent.mkdir(parents=True, exist_ok=True)
-
-    fig = plt.figure(figsize=(6, 5), dpi=140)
-    ax = fig.add_subplot(111, projection="3d")
-
-    x, y, z = coords[:, 0], coords[:, 1], coords[:, 2]
-    ax.plot(x, y, z, linewidth=1.8, alpha=0.85)
-    ax.scatter(x, y, z, s=14, c=range(len(coords)), cmap="viridis")
-
-    ax.set_title(title)
-    ax.set_xlabel("X")
-    ax.set_ylabel("Y")
-    ax.set_zlabel("Z")
-    plt.tight_layout()
-    fig.savefig(out)
-    plt.close(fig)
-
-
-def save_multiview_image(coords: np.ndarray, out_path: str, title: str = "Predicted Protein") -> None:
-    out = Path(out_path)
-    out.parent.mkdir(parents=True, exist_ok=True)
-
-    fig = plt.figure(figsize=(12, 4), dpi=140)
-    views = [(20, 30, "Front/iso"), (20, 120, "Side"), (85, 0, "Top")]
-    x, y, z = coords[:, 0], coords[:, 1], coords[:, 2]
-
-    for i, (elev, azim, subtitle) in enumerate(views, start=1):
-        ax = fig.add_subplot(1, 3, i, projection="3d")
-        ax.plot(x, y, z, linewidth=1.8, alpha=0.9)
-        ax.scatter(x, y, z, s=10, c=range(len(coords)), cmap="viridis")
-        ax.view_init(elev=elev, azim=azim)
-        ax.set_title(subtitle)
-        ax.set_xlabel("X")
-        ax.set_ylabel("Y")
-        ax.set_zlabel("Z")
-
-    fig.suptitle(title)
-    plt.tight_layout()
-    fig.savefig(out)
-    plt.close(fig)
-
-
-def save_rotation_gif(coords: np.ndarray, out_path: str, title: str = "Predicted Protein", frames: int = 60, fps: int = 20) -> None:
-    out = Path(out_path)
-    out.parent.mkdir(parents=True, exist_ok=True)
-
-    fig = plt.figure(figsize=(6, 5), dpi=110)
-    ax = fig.add_subplot(111, projection="3d")
-    x, y, z = coords[:, 0], coords[:, 1], coords[:, 2]
-    ax.plot(x, y, z, linewidth=1.8, alpha=0.9)
-    ax.scatter(x, y, z, s=14, c=range(len(coords)), cmap="viridis")
-    ax.set_title(title)
-    ax.set_xlabel("X")
-    ax.set_ylabel("Y")
-    ax.set_zlabel("Z")
-
-    def _update(frame: int):
-        ax.view_init(elev=24, azim=(360.0 * frame / max(1, frames)))
-        return ()
-
-    ani = animation.FuncAnimation(fig, _update, frames=frames, interval=int(1000 / max(1, fps)))
-    writer = animation.PillowWriter(fps=fps)
-    ani.save(str(out), writer=writer)
-    plt.close(fig)
+        return "\n".join(lines + ["TER", "END"]) + "\n"
 
 
 @dataclass
 class TrainingResult:
     train_losses: List[float]
     val_losses: List[float]
-    lrs: List[float]
     best_val_loss: float
-    epochs_ran: int
     best_epoch: int
+    epochs_ran: int
+    lrs: List[float]
 
 
 class RealStructureDataset:
@@ -203,9 +131,7 @@ class RealStructureDataset:
             for chain in model:
                 seq, coords = [], []
                 for residue in chain:
-                    if not is_aa(residue, standard=True):
-                        continue
-                    if "CA" not in residue:
+                    if not is_aa(residue, standard=True) or "CA" not in residue:
                         continue
                     aa = RES3_TO_1.get(residue.get_resname().upper(), "X")
                     seq.append(aa)
@@ -219,9 +145,8 @@ class RealStructureDataset:
         parser = PDBParser(QUIET=True)
         out: List[StructureExample] = []
         for p in pdb_paths:
-            path = Path(p)
-            structure = parser.get_structure(path.stem, str(path))
-            ex = cls._extract_from_structure(structure, path.stem, min_len=min_len, max_len=max_len)
+            structure = parser.get_structure(Path(p).stem, str(p))
+            ex = cls._extract_from_structure(structure, Path(p).stem, min_len=min_len, max_len=max_len)
             if ex is not None:
                 out.append(ex)
         return cls(out)
@@ -232,13 +157,10 @@ class RealStructureDataset:
         pdbl = PDBList(verbose=False)
         parser = PDBParser(QUIET=True)
         out: List[StructureExample] = []
-
         for pid in pdb_ids:
-            pid = pid.lower()
             try:
-                local_file = pdbl.retrieve_pdb_file(pid, pdir=cache_dir, file_format="pdb", overwrite=False)
-                structure = parser.get_structure(pid, local_file)
-                ex = cls._extract_from_structure(structure, pid, min_len=min_len, max_len=max_len)
+                local_file = pdbl.retrieve_pdb_file(pid.lower(), pdir=cache_dir, file_format="pdb", overwrite=False)
+                ex = cls._extract_from_structure(parser.get_structure(pid, local_file), pid, min_len=min_len, max_len=max_len)
                 if ex is not None:
                     out.append(ex)
             except Exception:
@@ -246,30 +168,87 @@ class RealStructureDataset:
         return cls(out)
 
 
+def save_structure_image(coords: np.ndarray, out_path: str, title: str = "Predicted Protein") -> None:
+    out = Path(out_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    fig = plt.figure(figsize=(6, 5), dpi=140)
+    ax = fig.add_subplot(111, projection="3d")
+    x, y, z = coords[:, 0], coords[:, 1], coords[:, 2]
+    ax.plot(x, y, z, linewidth=1.8)
+    ax.scatter(x, y, z, s=12, c=np.arange(len(coords)), cmap="viridis")
+    ax.set_title(title)
+    plt.tight_layout()
+    fig.savefig(out)
+    plt.close(fig)
+
+
+def save_multiview_image(coords: np.ndarray, out_path: str, title: str = "Predicted Protein") -> None:
+    out = Path(out_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    fig = plt.figure(figsize=(12, 4), dpi=140)
+    x, y, z = coords[:, 0], coords[:, 1], coords[:, 2]
+    for i, (e, a, name) in enumerate([(20, 30, "iso"), (20, 120, "side"), (90, 0, "top")], start=1):
+        ax = fig.add_subplot(1, 3, i, projection="3d")
+        ax.plot(x, y, z, linewidth=1.8)
+        ax.scatter(x, y, z, s=10, c=np.arange(len(coords)), cmap="viridis")
+        ax.view_init(elev=e, azim=a)
+        ax.set_title(name)
+    fig.suptitle(title)
+    plt.tight_layout()
+    fig.savefig(out)
+    plt.close(fig)
+
+
+def save_rotation_gif(coords: np.ndarray, out_path: str, title: str = "Predicted Protein", frames: int = 60, fps: int = 20) -> None:
+    out = Path(out_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    fig = plt.figure(figsize=(6, 5), dpi=110)
+    ax = fig.add_subplot(111, projection="3d")
+    x, y, z = coords[:, 0], coords[:, 1], coords[:, 2]
+    ax.plot(x, y, z, linewidth=1.8)
+    ax.scatter(x, y, z, s=12, c=np.arange(len(coords)), cmap="viridis")
+    ax.set_title(title)
+
+    def _u(f: int):
+        ax.view_init(elev=24, azim=360.0 * f / max(1, frames))
+        return ()
+
+    ani = animation.FuncAnimation(fig, _u, frames=frames, interval=int(1000 / max(1, fps)))
+    ani.save(str(out), writer=animation.PillowWriter(fps=fps))
+    plt.close(fig)
+
+
 class TrainableProteinModel:
     def __init__(self, config: Optional[ModelConfig] = None):
         self.config = config or ModelConfig()
         self.rng = np.random.default_rng(self.config.random_seed)
         self.params = self._init_params()
-        self.ema_params = copy.deepcopy(self.params)
 
     def _init_params(self) -> Dict[str, np.ndarray]:
         d_in = len(AA_VOCAB) + 6
-        h = self.config.d_hidden
-        t = self.config.torsion_bins * 3
-        db = self.config.dist_bins
+        dn, dp = self.config.d_node, self.config.d_pair
+        tb, db = self.config.torsion_bins * 3, self.config.dist_bins
 
         def n(*shape: int, scale: float = 0.05) -> np.ndarray:
             return self.rng.normal(0.0, scale, size=shape)
 
         return {
-            "W1": n(d_in, h), "b1": np.zeros(h),
-            "W2": n(h, h), "b2": np.zeros(h),
-            "W3": n(h, h), "b3": np.zeros(h),
-            "W_coord": n(h, 3), "b_coord": np.zeros(3),
-            "W_tors": n(h, t), "b_tors": np.zeros(t),
-            "W_conf": n(h, 1), "b_conf": np.zeros(1),
-            "W_pair": n(h, db), "b_pair": np.zeros(db),
+            # node trunk
+            "W_in": n(d_in, dn), "b_in": np.zeros(dn),
+            "W_msg": n(dn + dp + 9, dn), "b_msg": np.zeros(dn),
+            "W_attn_q": n(dn, dn), "W_attn_k": n(dn, dn), "W_attn_v": n(dn, dn),
+            # pair trunk + triangles
+            "W_pair_init": n(dn, dp),
+            "W_tri_mul": n(dp, dp),
+            "W_tri_attn_q": n(dp, dp), "W_tri_attn_k": n(dp, dp), "W_tri_attn_v": n(dp, dp),
+            # se(3)-style update
+            "W_coord_gate": n(dn + dp, 1),
+            # heads
+            "W_coord": n(dn, 3), "b_coord": np.zeros(3),
+            "W_tors": n(dn, tb), "b_tors": np.zeros(tb),
+            "W_dist": n(dp, db), "b_dist": np.zeros(db),
+            "W_conf": n(dn, 1), "b_conf": np.zeros(1),
+            "W_pae": n(dp, 1), "b_pae": np.zeros(1),
         }
 
     @staticmethod
@@ -280,23 +259,13 @@ class TrainableProteinModel:
         aromatic = set("FWYH")
         special = set("CGP")
         small = set("AGSCTPDN")
-        return np.asarray([
-            [
-                float(aa in hydrophobic),
-                float(aa in positive),
-                float(aa in negative),
-                float(aa in aromatic),
-                float(aa in special),
-                float(aa in small),
-            ]
-            for aa in sequence
-        ], dtype=np.float64)
+        return np.asarray([[float(a in hydrophobic), float(a in positive), float(a in negative), float(a in aromatic), float(a in special), float(a in small)] for a in sequence], dtype=np.float64)
 
     @staticmethod
     def _encode(sequence: str) -> np.ndarray:
         oh = np.zeros((len(sequence), len(AA_VOCAB)), dtype=np.float64)
-        for i, a in enumerate(sequence):
-            oh[i, AA_TO_IDX.get(a, AA_TO_IDX["X"])] = 1.0
+        for i, aa in enumerate(sequence):
+            oh[i, AA_TO_IDX.get(aa, AA_TO_IDX["X"])] = 1.0
         return np.concatenate([oh, TrainableProteinModel._bio_features(sequence)], axis=-1)
 
     @staticmethod
@@ -305,11 +274,232 @@ class TrainableProteinModel:
         e = anp.exp(x)
         return e / anp.clip(anp.sum(e, axis=axis, keepdims=True), 1e-9, None)
 
-    def _dropout(self, x: anp.ndarray, p: float, training: bool) -> anp.ndarray:
-        if (not training) or p <= 0:
-            return x
-        mask = (self.rng.random(x.shape) > p).astype(np.float64)
-        return x * mask / max(1e-8, (1.0 - p))
+    def _pairwise(self, coords: anp.ndarray) -> Tuple[anp.ndarray, anp.ndarray, anp.ndarray]:
+        rel = coords[:, None, :] - coords[None, :, :]
+        dist = anp.sqrt(anp.sum(rel * rel, axis=-1) + 1e-8)
+        unit = rel / anp.expand_dims(dist + 1e-8, -1)
+        return rel, dist, unit
+
+    def _graph_mask(self, coords: anp.ndarray) -> anp.ndarray:
+        _, dist, _ = self._pairwise(coords)
+        n = dist.shape[0]
+        if self.config.use_radius_graph:
+            m = dist < self.config.radius_cutoff
+            m = m * (1 - anp.eye(n))
+            return m.astype(anp.float64)
+
+        # kNN graph
+        idx = np.argsort(np.asarray(dist), axis=1)[:, 1:self.config.knn_k + 1]
+        m = np.zeros((n, n), dtype=np.float64)
+        for i in range(n):
+            m[i, idx[i]] = 1.0
+        return anp.asarray(np.maximum(m, m.T))
+
+    def _spherical_harmonics_feat(self, unit: anp.ndarray) -> anp.ndarray:
+        x, y, z = unit[..., 0], unit[..., 1], unit[..., 2]
+        y00 = anp.ones_like(x)
+        # l=1 real
+        y1m = anp.stack([x, y, z], axis=-1)
+        # l=2 real (compact basis)
+        y2 = anp.stack([x * y, y * z, z * x, x * x - y * y, 3 * z * z - 1], axis=-1)
+        return anp.concatenate([anp.expand_dims(y00, -1), y1m, y2], axis=-1)  # [...,9]
+
+    def _triangle_update(self, pair: anp.ndarray) -> anp.ndarray:
+        # multiplicative-ish
+        h = anp.tanh(anp.einsum("ijd,dk->ijk", pair, self.params["W_tri_mul"]))
+        mul = anp.einsum("ikd,kjd->ijd", h, h) / anp.sqrt(pair.shape[-1])
+
+        q = anp.einsum("ijd,dk->ijk", pair, self.params["W_tri_attn_q"])
+        k = anp.einsum("ijd,dk->ijk", pair, self.params["W_tri_attn_k"])
+        v = anp.einsum("ijd,dk->ijk", pair, self.params["W_tri_attn_v"])
+        logits = anp.einsum("ijd,ikd->ijk", q, k) / anp.sqrt(pair.shape[-1])
+        attn = self._softmax(logits, axis=-1)
+        attn_out = anp.einsum("ijk,ikd->ijd", attn, v)
+
+        out = pair + 0.2 * anp.tanh(mul) + 0.2 * anp.tanh(attn_out)
+        return 0.5 * (out + anp.transpose(out, (1, 0, 2)))
+
+    def _long_range_attention(self, node: anp.ndarray, pair: anp.ndarray) -> anp.ndarray:
+        q = anp.dot(node, self.params["W_attn_q"])
+        k = anp.dot(node, self.params["W_attn_k"])
+        v = anp.dot(node, self.params["W_attn_v"])
+        logits = anp.dot(q, k.T) / anp.sqrt(node.shape[-1]) + 0.05 * anp.mean(pair, axis=-1)
+        a = self._softmax(logits, axis=-1)
+        return node + anp.dot(a, v)
+
+    def _message_passing(self, node: anp.ndarray, pair: anp.ndarray, coords: anp.ndarray, graph: anp.ndarray) -> anp.ndarray:
+        rel, _, unit = self._pairwise(coords)
+        sh = self._spherical_harmonics_feat(unit)
+        n = node.shape[0]
+
+        msgs = []
+        for i in range(n):
+            feat_ij = anp.concatenate([
+                anp.repeat(anp.expand_dims(node[i], 0), n, axis=0),
+                pair[i],
+                sh[i],
+            ], axis=-1)
+            m_ij = anp.tanh(anp.dot(feat_ij, self.params["W_msg"]) + self.params["b_msg"])
+            m_i = anp.sum(m_ij * anp.expand_dims(graph[i], -1), axis=0) / (anp.sum(graph[i]) + 1e-8)
+            msgs.append(m_i)
+        return node + anp.stack(msgs, axis=0)
+
+    def _equivariant_coord_update(self, node: anp.ndarray, pair: anp.ndarray, coords: anp.ndarray, graph: anp.ndarray) -> anp.ndarray:
+        rel, dist, unit = self._pairwise(coords)
+        pair_scalar = anp.mean(pair, axis=-1)
+        n = coords.shape[0]
+        dcoords = []
+        for i in range(n):
+            ni = anp.repeat(anp.expand_dims(node[i], 0), n, axis=0)
+            feat = anp.concatenate([ni, pair[i]], axis=-1)
+            gate = 1.0 / (1.0 + anp.exp(-anp.squeeze(anp.dot(feat, self.params["W_coord_gate"]), axis=-1)))
+            w = gate * graph[i] / (dist[i] + 1e-6)
+            dc = anp.sum(anp.expand_dims(w, -1) * unit[i], axis=0)
+            dcoords.append(dc)
+        new_coords = coords + 0.1 * anp.stack(dcoords, axis=0)
+        return new_coords - anp.mean(new_coords, axis=0, keepdims=True)
+
+    def _forward(self, params: Dict[str, anp.ndarray], sequence: str, recycle_override: Optional[int] = None) -> Tuple[anp.ndarray, anp.ndarray, anp.ndarray, anp.ndarray, anp.ndarray]:
+        # bind params for autograd
+        old = self.params
+        self.params = params
+
+        x = anp.asarray(self._encode(sequence))
+        node = anp.tanh(anp.dot(x, self.params["W_in"]) + self.params["b_in"])  # NxD
+        coords = anp.concatenate([anp.arange(len(sequence))[:, None], anp.zeros((len(sequence), 2))], axis=1)
+        coords = coords - anp.mean(coords, axis=0, keepdims=True)
+        pair = anp.repeat(anp.expand_dims(anp.dot(node, self.params["W_pair_init"]), 1), len(sequence), axis=1)
+        pair = 0.5 * (pair + anp.transpose(pair, (1, 0, 2)))
+
+        n_recycles = self.config.n_recycles if recycle_override is None else recycle_override
+        for _ in range(n_recycles):
+            graph = self._graph_mask(coords)
+            for _ in range(self.config.n_message_layers):
+                node = self._message_passing(node, pair, coords, graph)
+                node = self._long_range_attention(node, pair)
+                coords = self._equivariant_coord_update(node, pair, coords, graph)
+            for _ in range(self.config.n_triangle_layers):
+                pair = self._triangle_update(pair)
+
+        tors = anp.dot(node, self.params["W_tors"]) + self.params["b_tors"]
+        tors = tors.reshape((len(sequence), 3, self.config.torsion_bins))
+        dist_logits = anp.einsum("ijd,dk->ijk", pair, self.params["W_dist"]) + self.params["b_dist"]
+        conf = 100.0 / (1.0 + anp.exp(-(anp.dot(node, self.params["W_conf"]) + self.params["b_conf"]))).reshape((len(sequence),))
+        pae = anp.squeeze(anp.einsum("ijd,dk->ijk", pair, self.params["W_pae"]) + self.params["b_pae"], axis=-1)
+        pae = 0.5 * (pae + pae.T)
+
+        self.params = old
+        return coords, tors, dist_logits, conf, pae
+
+    def _fape_like(self, pred: anp.ndarray, true: anp.ndarray) -> anp.ndarray:
+        pred_c = pred - anp.mean(pred, axis=0, keepdims=True)
+        true_c = true - anp.mean(true, axis=0, keepdims=True)
+        return anp.mean(anp.sqrt(anp.sum((pred_c - true_c) ** 2, axis=-1) + 1e-8))
+
+    def _lddt_like(self, pred: anp.ndarray, true: anp.ndarray) -> anp.ndarray:
+        pd = anp.sqrt(anp.sum((pred[:, None, :] - pred[None, :, :]) ** 2, axis=-1) + 1e-8)
+        td = anp.sqrt(anp.sum((true[:, None, :] - true[None, :, :]) ** 2, axis=-1) + 1e-8)
+        diff = anp.abs(pd - td)
+        score = (diff < 0.5) + (diff < 1.0) + (diff < 2.0) + (diff < 4.0)
+        return 1.0 - anp.mean(score / 4.0)
+
+    def _example_loss(self, params: Dict[str, anp.ndarray], ex: StructureExample) -> anp.ndarray:
+        y = anp.asarray(ex.coords)
+        coords, tors, dist_logits, conf, pae = self._forward(params, ex.sequence)
+
+        fape = self._fape_like(coords, y)
+
+        td = anp.sqrt(anp.sum((y[:, None, :] - y[None, :, :]) ** 2, axis=-1) + 1e-8)
+        dbin = anp.clip(anp.floor(td / 1.5), 0, self.config.dist_bins - 1).astype(int)
+        probs = self._softmax(dist_logits, axis=-1)
+        ii = anp.arange(len(y))[:, None]
+        jj = anp.arange(len(y))[None, :]
+        dist_ce = -anp.mean(anp.log(anp.clip(probs[ii, jj, dbin], 1e-9, 1.0)))
+
+        bond = anp.sqrt(anp.sum((coords[1:] - coords[:-1]) ** 2, axis=-1) + 1e-8)
+        bond_loss = anp.mean((bond - 3.8) ** 2)
+
+        # clash penalty
+        pd = anp.sqrt(anp.sum((coords[:, None, :] - coords[None, :, :]) ** 2, axis=-1) + 1e-8)
+        mask = 1 - anp.eye(len(y))
+        clash = anp.mean(anp.maximum(0.0, 1.2 - pd) * mask)
+
+        # torsion regularization (proxy)
+        tors_loss = 0.001 * anp.mean(tors ** 2)
+
+        lddt = self._lddt_like(coords, y)
+        conf_loss = anp.mean((conf - 70.0) ** 2) / 1000.0
+
+        # pairwise error supervision
+        pae_target = anp.abs(pd - td)
+        pae_loss = anp.mean((pae - pae_target) ** 2) / 25.0
+
+        wd = self.config.weight_decay * sum(anp.mean(v * v) for k, v in params.items() if k.startswith("W"))
+        return 1.0 * fape + 0.4 * dist_ce + 0.1 * bond_loss + 0.1 * clash + 0.15 * lddt + tors_loss + 0.05 * conf_loss + 0.1 * pae_loss + wd
+
+    def _batch_loss(self, params: Dict[str, anp.ndarray], batch: Sequence[StructureExample]) -> anp.ndarray:
+        return anp.mean(anp.stack([self._example_loss(params, ex) for ex in batch]))
+
+    def fit(self, dataset: RealStructureDataset) -> TrainingResult:
+        if not dataset.examples:
+            raise ValueError("Dataset is empty.")
+
+        examples = dataset.examples.copy()
+        self.rng.shuffle(examples)
+        n_val = max(1, int(len(examples) * self.config.val_split)) if len(examples) > 2 else 0
+        val_examples = examples[:n_val]
+        train_examples = examples[n_val:] if n_val > 0 else examples
+
+        gfun = grad(self._batch_loss)
+        m = {k: np.zeros_like(v) for k, v in self.params.items()}
+        v = {k: np.zeros_like(v) for k, v in self.params.items()}
+
+        train_hist, val_hist, lr_hist = [], [], []
+        best_val, best_epoch = float("inf"), 0
+        best_params = copy.deepcopy(self.params)
+        patience = 0
+        t = 0
+
+        for epoch in range(self.config.epochs):
+            self.rng.shuffle(train_examples)
+            batches = [train_examples[i:i + self.config.batch_size] for i in range(0, len(train_examples), self.config.batch_size)]
+            epoch_losses = []
+
+            for batch in batches:
+                t += 1
+                g = gfun(self.params, batch)
+                norm = np.sqrt(sum(np.sum(np.asarray(gk) ** 2) for gk in g.values()))
+                scale = min(1.0, self.config.grad_clip_norm / max(norm, 1e-8))
+                for k in self.params:
+                    grad_k = np.asarray(g[k]) * scale
+                    m[k] = 0.9 * m[k] + 0.1 * grad_k
+                    v[k] = 0.999 * v[k] + 0.001 * (grad_k ** 2)
+                    mhat = m[k] / (1 - 0.9 ** t)
+                    vhat = v[k] / (1 - 0.999 ** t)
+                    self.params[k] = self.params[k] - self.config.lr * mhat / (np.sqrt(vhat) + 1e-8)
+                epoch_losses.append(float(self._batch_loss(self.params, batch)))
+
+            train_loss = float(np.mean(epoch_losses))
+            val_loss = float(self._batch_loss(self.params, val_examples)) if val_examples else train_loss
+            train_hist.append(train_loss)
+            val_hist.append(val_loss)
+            lr_hist.append(float(self.config.lr))
+
+            if val_loss < best_val:
+                best_val = val_loss
+                best_epoch = epoch
+                best_params = copy.deepcopy(self.params)
+                patience = 0
+            else:
+                patience += 1
+            if patience >= self.config.early_stopping_patience:
+                break
+
+        self.params = best_params
+        return TrainingResult(train_hist, val_hist, best_val, best_epoch, len(train_hist), lr_hist)
+
+    def train(self, dataset: RealStructureDataset) -> List[float]:
+        return self.fit(dataset).train_losses
 
     @staticmethod
     def _kabsch_rmsd(pred: np.ndarray, true: np.ndarray) -> float:
@@ -321,226 +511,33 @@ class TrainableProteinModel:
         if np.linalg.det(r) < 0:
             vt[-1, :] *= -1
             r = vt.T @ u.T
-        p_aligned = p @ r
-        return float(np.sqrt(np.mean(np.sum((p_aligned - t) ** 2, axis=-1))))
-
-    @staticmethod
-    def _contact_prf(pred: np.ndarray, true: np.ndarray, threshold: float = 8.0) -> Tuple[float, float, float]:
-        pd = np.sqrt(np.sum((pred[:, None, :] - pred[None, :, :]) ** 2, axis=-1) + 1e-8)
-        td = np.sqrt(np.sum((true[:, None, :] - true[None, :, :]) ** 2, axis=-1) + 1e-8)
-        m = ~np.eye(len(pred), dtype=bool)
-        p = (pd < threshold) & m
-        t = (td < threshold) & m
-        tp = float((p & t).sum())
-        fp = float((p & ~t).sum())
-        fn = float((~p & t).sum())
-        precision = tp / max(tp + fp, 1.0)
-        recall = tp / max(tp + fn, 1.0)
-        f1 = 2 * precision * recall / max(precision + recall, 1e-9)
-        return precision, recall, f1
-
-    def _forward_autograd(self, params: Dict[str, anp.ndarray], x: anp.ndarray, training: bool = False) -> Tuple[anp.ndarray, anp.ndarray, anp.ndarray, anp.ndarray]:
-        h1 = anp.tanh(anp.dot(x, params["W1"]) + params["b1"])
-        h1 = self._dropout(h1, self.config.dropout_rate, training)
-        h2 = anp.tanh(anp.dot(h1, params["W2"]) + params["b2"])
-        h2 = h2 + 0.5 * h1  # residual
-        h2 = self._dropout(h2, self.config.dropout_rate, training)
-        h3 = anp.tanh(anp.dot(h2, params["W3"]) + params["b3"])
-        h = h3 + 0.5 * h2
-
-        coords = anp.dot(h, params["W_coord"]) + params["b_coord"]
-        coords = coords - anp.mean(coords, axis=0, keepdims=True)
-
-        tors = anp.dot(h, params["W_tors"]) + params["b_tors"]
-        tors = tors.reshape((x.shape[0], 3, self.config.torsion_bins))
-
-        conf = 100.0 / (1.0 + anp.exp(-(anp.dot(h, params["W_conf"]) + params["b_conf"]))).reshape((x.shape[0],))
-
-        pair_f = h[:, None, :] + h[None, :, :]
-        dist_logits = anp.einsum("ijd,db->ijb", pair_f, params["W_pair"]) + params["b_pair"]
-        return coords, tors, dist_logits, conf
-
-    def _augment_coords(self, coords: np.ndarray) -> np.ndarray:
-        if self.config.augment_noise_std <= 0:
-            return coords
-        noisy = coords + self.rng.normal(0.0, self.config.augment_noise_std, size=coords.shape)
-        return noisy - noisy.mean(axis=0, keepdims=True)
-
-    def _example_loss(self, params: Dict[str, anp.ndarray], ex: StructureExample) -> anp.ndarray:
-        x = anp.asarray(self._encode(ex.sequence))
-        y = anp.asarray(self._augment_coords(ex.coords - ex.coords.mean(axis=0, keepdims=True)))
-
-        pred_coords, tors, dist_logits, conf = self._forward_autograd(params, x, training=True)
-
-        coord_loss = anp.mean((pred_coords - y) ** 2)
-
-        b = pred_coords[1:] - pred_coords[:-1]
-        bond_len = anp.sqrt(anp.sum(b * b, axis=-1) + 1e-8)
-        bond_loss = anp.mean((bond_len - 3.8) ** 2)
-
-        d_true = anp.sqrt(anp.sum((y[:, None, :] - y[None, :, :]) ** 2, axis=-1) + 1e-8)
-        d_bin = anp.clip(anp.floor(d_true / 1.5), 0, self.config.dist_bins - 1).astype(int)
-        probs = self._softmax(dist_logits, axis=-1)
-        idx_i = anp.arange(y.shape[0])[:, None]
-        idx_j = anp.arange(y.shape[0])[None, :]
-        picked = probs[idx_i, idx_j, d_bin]
-        dist_loss = -anp.mean(anp.log(anp.clip(picked, 1e-9, 1.0)))
-
-        conf_loss = anp.mean((conf - 70.0) ** 2) / 1000.0
-        wd = self.config.weight_decay * sum(anp.mean(v * v) for k, v in params.items() if k.startswith("W"))
-
-        return coord_loss + 0.12 * bond_loss + 0.24 * dist_loss + 0.05 * conf_loss + 0.001 * anp.mean(tors ** 2) + wd
-
-    def _batch_loss(self, params: Dict[str, anp.ndarray], batch: Sequence[StructureExample]) -> anp.ndarray:
-        return anp.mean(anp.stack([self._example_loss(params, ex) for ex in batch]))
-
-    def _lr_for_epoch(self, epoch: int) -> float:
-        if epoch < self.config.warmup_epochs:
-            return self.config.lr * (epoch + 1) / max(1, self.config.warmup_epochs)
-        e = epoch - self.config.warmup_epochs
-        total = max(1, self.config.epochs - self.config.warmup_epochs)
-        cosine = 0.5 * (1 + math.cos(math.pi * e / total))
-        return self.config.lr * (self.config.min_lr_ratio + (1 - self.config.min_lr_ratio) * cosine)
-
-    def _curriculum_batches(self, examples: List[StructureExample]) -> List[List[StructureExample]]:
-        if not self.config.curriculum:
-            self.rng.shuffle(examples)
-            return [examples[i:i + self.config.batch_size] for i in range(0, len(examples), self.config.batch_size)]
-
-        sorted_ex = sorted(examples, key=lambda ex: len(ex.sequence))
-        buckets = [sorted_ex[i:i + self.config.batch_size] for i in range(0, len(sorted_ex), self.config.batch_size)]
-        # slight randomization across neighboring buckets to avoid overfitting order
-        self.rng.shuffle(buckets)
-        return buckets
-
-    def fit(self, dataset: RealStructureDataset) -> TrainingResult:
-        if not dataset.examples:
-            raise ValueError("Dataset is empty. Provide valid PDB structures.")
-
-        examples = dataset.examples.copy()
-        self.rng.shuffle(examples)
-
-        n_val = max(1, int(len(examples) * self.config.val_split)) if len(examples) > 2 else 0
-        val_examples = examples[:n_val]
-        train_examples = examples[n_val:] if n_val > 0 else examples
-
-        loss_grad = grad(self._batch_loss)
-        train_hist, val_hist, lrs = [], [], []
-
-        m = {k: np.zeros_like(v) for k, v in self.params.items()}
-        v = {k: np.zeros_like(v) for k, v in self.params.items()}
-        b1, b2, eps = 0.9, 0.999, 1e-8
-
-        best_val = float("inf")
-        best_params = copy.deepcopy(self.params)
-        best_epoch = 0
-        patience = 0
-        step_t = 0
-
-        swa_start = int(self.config.epochs * self.config.swa_start_ratio)
-        swa_params = copy.deepcopy(self.params)
-        swa_n = 0
-
-        for epoch in range(self.config.epochs):
-            batches = self._curriculum_batches(train_examples.copy())
-            lr_epoch = self._lr_for_epoch(epoch)
-            lrs.append(lr_epoch)
-            epoch_losses = []
-
-            for batch in batches:
-                step_t += 1
-                g = loss_grad(self.params, batch)
-
-                global_norm = np.sqrt(sum(np.sum(np.asarray(gk) ** 2) for gk in g.values()))
-                clip_scale = min(1.0, self.config.grad_clip_norm / max(global_norm, 1e-8))
-
-                for k in self.params:
-                    grad_k = np.asarray(g[k]) * clip_scale
-                    m[k] = b1 * m[k] + (1 - b1) * grad_k
-                    v[k] = b2 * v[k] + (1 - b2) * (grad_k ** 2)
-                    m_hat = m[k] / (1 - b1 ** step_t)
-                    v_hat = v[k] / (1 - b2 ** step_t)
-                    self.params[k] = self.params[k] - lr_epoch * m_hat / (np.sqrt(v_hat) + eps)
-
-                    # EMA update
-                    self.ema_params[k] = self.config.ema_decay * self.ema_params[k] + (1 - self.config.ema_decay) * self.params[k]
-
-                epoch_losses.append(float(self._batch_loss(self.params, batch)))
-
-            # SWA averaging in late epochs
-            if self.config.use_swa and epoch >= swa_start:
-                swa_n += 1
-                for k in self.params:
-                    swa_params[k] = (swa_params[k] * (swa_n - 1) + self.params[k]) / swa_n
-
-            train_loss = float(np.mean(epoch_losses))
-            train_hist.append(train_loss)
-
-            eval_params = self.ema_params if self.config.use_ema_for_eval else self.params
-            if val_examples:
-                val_loss = float(self._batch_loss(eval_params, val_examples))
-            else:
-                val_loss = train_loss
-            val_hist.append(val_loss)
-
-            if val_loss < best_val:
-                best_val = val_loss
-                best_params = copy.deepcopy(eval_params)
-                best_epoch = epoch
-                patience = 0
-            else:
-                patience += 1
-
-            if patience >= self.config.early_stopping_patience:
-                break
-
-        # finalize with best params; optionally blend with SWA
-        if self.config.use_swa and swa_n > 0:
-            for k in best_params:
-                best_params[k] = 0.5 * best_params[k] + 0.5 * swa_params[k]
-
-        self.params = best_params
-        self.ema_params = copy.deepcopy(best_params)
-
-        return TrainingResult(
-            train_losses=train_hist,
-            val_losses=val_hist,
-            lrs=lrs,
-            best_val_loss=best_val,
-            epochs_ran=len(train_hist),
-            best_epoch=best_epoch,
-        )
-
-    def train(self, dataset: RealStructureDataset) -> List[float]:
-        return self.fit(dataset).train_losses
+        return float(np.sqrt(np.mean(np.sum((p @ r - t) ** 2, axis=-1))))
 
     def evaluate(self, dataset: RealStructureDataset) -> Dict[str, float]:
-        if not dataset.examples:
-            raise ValueError("Dataset is empty.")
-
-        rmsds, precisions, recalls, f1s, losses, maes = [], [], [], [], [], []
+        losses, rmsd, cp, cr, mae = [], [], [], [], []
         for ex in dataset.examples:
             pred = self.predict(ex.sequence)
             losses.append(float(self._batch_loss(self.params, [ex])))
-            rmsds.append(self._kabsch_rmsd(pred.coords, ex.coords))
-            p, r, f1 = self._contact_prf(pred.coords, ex.coords)
-            precisions.append(p)
-            recalls.append(r)
-            f1s.append(f1)
-
+            rmsd.append(self._kabsch_rmsd(pred.coords, ex.coords))
             pd = np.sqrt(np.sum((pred.coords[:, None, :] - pred.coords[None, :, :]) ** 2, axis=-1) + 1e-8)
             td = np.sqrt(np.sum((ex.coords[:, None, :] - ex.coords[None, :, :]) ** 2, axis=-1) + 1e-8)
-            maes.append(float(np.mean(np.abs(pd - td))))
-
+            mae.append(float(np.mean(np.abs(pd - td))))
+            m = ~np.eye(len(pred.coords), dtype=bool)
+            p = (pd < 8.0) & m
+            t = (td < 8.0) & m
+            cp.append(float((p & t).sum() / max(p.sum(), 1)))
+            cr.append(float((p & t).sum() / max(t.sum(), 1)))
+        cpm = float(np.mean(cp)) if cp else 0.0
+        crm = float(np.mean(cr)) if cr else 0.0
+        f1 = (2.0 * cpm * crm / max(cpm + crm, 1e-8)) if (cpm + crm) > 0 else 0.0
         return {
-            "loss": float(np.mean(losses)),
-            "rmsd": float(np.mean(rmsds)),
-            "contact_precision": float(np.mean(precisions)),
-            "contact_recall": float(np.mean(recalls)),
-            "contact_f1": float(np.mean(f1s)),
-            "distance_mae": float(np.mean(maes)),
+            "loss": float(np.mean(losses)) if losses else 0.0,
+            "rmsd": float(np.mean(rmsd)) if rmsd else 0.0,
+            "contact_precision": cpm,
+            "contact_recall": crm,
+            "contact_f1": float(f1),
+            "distance_mae": float(np.mean(mae)) if mae else 0.0,
         }
-
 
     def evaluate_and_export_images(self, dataset: RealStructureDataset, out_dir: str, export_multiview: bool = False, export_gif: bool = False) -> Dict[str, float]:
         out = Path(out_dir)
@@ -548,8 +545,7 @@ class TrainableProteinModel:
         metrics = self.evaluate(dataset)
         for ex in dataset.examples:
             pred = self.predict(ex.sequence)
-            stem = out / ex.pdb_id
-            save_structure_image(pred.coords, str(stem.with_suffix(".png")), title=f"Predicted {ex.pdb_id}")
+            save_structure_image(pred.coords, str(out / f"{ex.pdb_id}.png"), title=f"Predicted {ex.pdb_id}")
             if export_multiview:
                 save_multiview_image(pred.coords, str(out / f"{ex.pdb_id}_multiview.png"), title=f"Predicted {ex.pdb_id}")
             if export_gif:
@@ -557,36 +553,41 @@ class TrainableProteinModel:
         return metrics
 
     def predict(self, sequence: str) -> Prediction:
-        x = self._encode(sequence)
-        coords, tors, dist, conf = self._forward_autograd(self.params, anp.asarray(x), training=False)
-        return Prediction(sequence=sequence, coords=np.asarray(coords), torsion_logits=np.asarray(tors), distogram_logits=np.asarray(dist), confidence=np.asarray(conf))
+        coords, tors, dist, conf, pae = self._forward(self.params, sequence)
+        return Prediction(sequence, np.asarray(coords), np.asarray(tors), np.asarray(dist), np.asarray(conf), np.asarray(pae))
 
-    def predict_ensemble(self, sequence: str, n_members: int = 8, noise_std: float = 0.01, mc_dropout: bool = True) -> Dict[str, object]:
-        members = []
-        x0 = self._encode(sequence)
+    def predict_ensemble(
+        self,
+        sequence: str,
+        n_members: int = 8,
+        recycle_jitter: bool = True,
+        mc_dropout: Optional[bool] = None,
+    ) -> Dict[str, object]:
+        # `mc_dropout` kept for API compatibility; this compact model uses recycle jitter
+        if mc_dropout is not None:
+            recycle_jitter = bool(mc_dropout)
+        preds = []
         for _ in range(max(1, n_members)):
-            x = x0 + self.rng.normal(0.0, noise_std, size=x0.shape)
-            coords, tors, dist, conf = self._forward_autograd(self.params, anp.asarray(x), training=mc_dropout)
-            members.append((np.asarray(coords), np.asarray(tors), np.asarray(dist), np.asarray(conf)))
-
-        coords_stack = np.stack([m[0] for m in members], axis=0)
-        conf_stack = np.stack([m[3] for m in members], axis=0)
+            recycles = self.config.n_recycles + (self.rng.integers(-1, 2) if recycle_jitter else 0)
+            recycles = max(1, int(recycles))
+            coords, tors, dist, conf, pae = self._forward(self.params, sequence, recycle_override=recycles)
+            preds.append((np.asarray(coords), np.asarray(conf), np.asarray(pae)))
+        c = np.stack([p[0] for p in preds], axis=0)
+        conf = np.stack([p[1] for p in preds], axis=0)
+        pae = np.stack([p[2] for p in preds], axis=0)
         return {
-            "members": len(members),
-            "mean_coords": coords_stack.mean(axis=0),
-            "coord_var": coords_stack.var(axis=0),
-            "mean_confidence": conf_stack.mean(axis=0),
-            "confidence_var": conf_stack.var(axis=0),
+            "members": len(preds),
+            "mean_coords": c.mean(axis=0),
+            "coord_var": c.var(axis=0),
+            "mean_confidence": conf.mean(axis=0),
+            "confidence_var": conf.var(axis=0),
+            "mean_pair_error": pae.mean(axis=0),
         }
 
     def save(self, path: str) -> None:
         out = Path(path)
-        metadata = {
-            "config": self.config.__dict__,
-            "format": out.suffix.lower(),
-        }
         if out.suffix.lower() == ".json":
-            out.write_text(json.dumps({"metadata": metadata, "params": {k: v.tolist() for k, v in self.params.items()}}))
+            out.write_text(json.dumps({"config": self.config.__dict__, "params": {k: v.tolist() for k, v in self.params.items()}}))
         else:
             np.savez(path, **self.params)
 
@@ -594,36 +595,38 @@ class TrainableProteinModel:
         src = Path(path)
         if src.suffix.lower() == ".json":
             payload = json.loads(src.read_text())
-            if "params" in payload:
-                payload = payload["params"]
+            payload = payload.get("params", payload)
             self.params = {k: np.asarray(v) for k, v in payload.items()}
         else:
-            loaded = np.load(path)
-            self.params = {k: loaded[k] for k in loaded.files}
-        self.ema_params = copy.deepcopy(self.params)
+            z = np.load(path)
+            self.params = {k: z[k] for k in z.files}
 
 
 def _parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="Ultra-advanced trainable protein prototype with real PDB ingestion")
+    p = argparse.ArgumentParser(description="Geometric SE(3)-style trainable protein prototype")
     p.add_argument("sequence", nargs="?", help="Sequence for inference")
-    p.add_argument("--train-pdb-ids", nargs="*", default=None, help="RCSB PDB IDs for training")
-    p.add_argument("--train-pdb-files", nargs="*", default=None, help="Local PDB files for training")
+    p.add_argument("--train-pdb-ids", nargs="*", default=None)
+    p.add_argument("--train-pdb-files", nargs="*", default=None)
     p.add_argument("--epochs", type=int, default=15)
     p.add_argument("--batch-size", type=int, default=2)
-    p.add_argument("--lr", type=float, default=8e-3)
+    p.add_argument("--lr", type=float, default=5e-3)
     p.add_argument("--val-split", type=float, default=0.2)
-    p.add_argument("--patience", type=int, default=8)
+    p.add_argument("--patience", type=int, default=6)
+    p.add_argument("--recycles", type=int, default=4)
+    p.add_argument("--knn-k", type=int, default=8)
+    p.add_argument("--radius-cutoff", type=float, default=10.0)
+    p.add_argument("--use-radius-graph", action="store_true")
     p.add_argument("--ensemble-size", type=int, default=0)
     p.add_argument("--json", action="store_true")
     p.add_argument("--save-model", default=None)
     p.add_argument("--load-model", default=None)
-    p.add_argument("--save-pred-pdb", default=None, help="Write predicted CA trace to a PDB file")
-    p.add_argument("--save-pred-image", default=None, help="Write predicted structure image PNG")
-    p.add_argument("--export-analysis-images-dir", default=None, help="When training, export one PNG per analyzed protein")
-    p.add_argument("--save-pred-multiview", default=None, help="Write 3-view PNG for a prediction")
-    p.add_argument("--save-pred-gif", default=None, help="Write rotating GIF for a prediction")
-    p.add_argument("--export-analysis-multiview", action="store_true", help="Also export multiview PNGs per analyzed protein")
-    p.add_argument("--export-analysis-gif", action="store_true", help="Also export rotating GIFs per analyzed protein")
+    p.add_argument("--save-pred-pdb", default=None)
+    p.add_argument("--save-pred-image", default=None)
+    p.add_argument("--save-pred-multiview", default=None)
+    p.add_argument("--save-pred-gif", default=None)
+    p.add_argument("--export-analysis-images-dir", default=None)
+    p.add_argument("--export-analysis-multiview", action="store_true")
+    p.add_argument("--export-analysis-gif", action="store_true")
     return p
 
 
@@ -635,9 +638,12 @@ def main() -> None:
         lr=args.lr,
         val_split=args.val_split,
         early_stopping_patience=args.patience,
+        n_recycles=args.recycles,
+        knn_k=args.knn_k,
+        radius_cutoff=args.radius_cutoff,
+        use_radius_graph=args.use_radius_graph,
     )
     model = TrainableProteinModel(cfg)
-
     if args.load_model:
         model.load(args.load_model)
 
@@ -645,22 +651,23 @@ def main() -> None:
     fit_result: Optional[TrainingResult] = None
     eval_metrics: Optional[Dict[str, float]] = None
 
-    if args.train_pdb_files:
-        ds = RealStructureDataset.from_local_pdbs(args.train_pdb_files, min_len=5)
-        if ds.examples:
-            fit_result = model.fit(ds)
-            if args.export_analysis_images_dir:
-                eval_metrics = model.evaluate_and_export_images(ds, args.export_analysis_images_dir, export_multiview=args.export_analysis_multiview, export_gif=args.export_analysis_gif)
-            else:
-                eval_metrics = model.evaluate(ds)
-            trained = True
+    for mode in ["files", "ids"]:
+        if mode == "files" and args.train_pdb_files:
+            ds = RealStructureDataset.from_local_pdbs(args.train_pdb_files, min_len=5)
+        elif mode == "ids" and args.train_pdb_ids:
+            ds = RealStructureDataset.from_rcsb_ids(args.train_pdb_ids, min_len=5)
+        else:
+            continue
 
-    if args.train_pdb_ids:
-        ds = RealStructureDataset.from_rcsb_ids(args.train_pdb_ids, min_len=5)
         if ds.examples:
             fit_result = model.fit(ds)
             if args.export_analysis_images_dir:
-                eval_metrics = model.evaluate_and_export_images(ds, args.export_analysis_images_dir, export_multiview=args.export_analysis_multiview, export_gif=args.export_analysis_gif)
+                eval_metrics = model.evaluate_and_export_images(
+                    ds,
+                    args.export_analysis_images_dir,
+                    export_multiview=args.export_analysis_multiview,
+                    export_gif=args.export_analysis_gif,
+                )
             else:
                 eval_metrics = model.evaluate(ds)
             trained = True
@@ -672,37 +679,37 @@ def main() -> None:
     if args.sequence:
         pred = model.predict(args.sequence)
         if args.save_pred_pdb:
-            out_pdb = Path(args.save_pred_pdb)
-            out_pdb.parent.mkdir(parents=True, exist_ok=True)
-            out_pdb.write_text(pred.to_pdb())
+            Path(args.save_pred_pdb).parent.mkdir(parents=True, exist_ok=True)
+            Path(args.save_pred_pdb).write_text(pred.to_pdb())
         if args.save_pred_image:
             save_structure_image(pred.coords, args.save_pred_image, title=f"Predicted {pred.sequence}")
         if args.save_pred_multiview:
             save_multiview_image(pred.coords, args.save_pred_multiview, title=f"Predicted {pred.sequence}")
         if args.save_pred_gif:
             save_rotation_gif(pred.coords, args.save_pred_gif, title=f"Predicted {pred.sequence}")
+
         out = {
             "sequence": pred.sequence,
             "trained": trained,
             "fit": {
                 "train_losses": fit_result.train_losses if fit_result else [],
                 "val_losses": fit_result.val_losses if fit_result else [],
-                "lrs": fit_result.lrs if fit_result else [],
                 "best_val_loss": fit_result.best_val_loss if fit_result else None,
-                "epochs_ran": fit_result.epochs_ran if fit_result else 0,
                 "best_epoch": fit_result.best_epoch if fit_result else None,
+                "epochs_ran": fit_result.epochs_ran if fit_result else 0,
             },
             "eval_metrics": eval_metrics,
             "coords": pred.coords.tolist(),
             "torsion_logits_shape": list(pred.torsion_logits.shape),
             "distogram_logits_shape": list(pred.distogram_logits.shape),
             "confidence": pred.confidence.tolist(),
+            "pair_error_shape": list(pred.pair_error.shape),
             "saved_model": args.save_model if (args.save_model and trained) else None,
-            "saved_prediction_pdb": args.save_pred_pdb if args.save_pred_pdb else None,
-            "saved_prediction_image": args.save_pred_image if args.save_pred_image else None,
-            "saved_prediction_multiview": args.save_pred_multiview if args.save_pred_multiview else None,
-            "saved_prediction_gif": args.save_pred_gif if args.save_pred_gif else None,
-            "analysis_images_dir": args.export_analysis_images_dir if args.export_analysis_images_dir else None,
+            "saved_prediction_pdb": args.save_pred_pdb,
+            "saved_prediction_image": args.save_pred_image,
+            "saved_prediction_multiview": args.save_pred_multiview,
+            "saved_prediction_gif": args.save_pred_gif,
+            "analysis_images_dir": args.export_analysis_images_dir,
         }
 
         if args.ensemble_size > 0:
@@ -713,6 +720,7 @@ def main() -> None:
                 "coord_var": ens["coord_var"].tolist(),
                 "mean_confidence": ens["mean_confidence"].tolist(),
                 "confidence_var": ens["confidence_var"].tolist(),
+                "mean_pair_error": ens["mean_pair_error"].tolist(),
             }
 
         if args.json:
@@ -721,21 +729,10 @@ def main() -> None:
             print(f"Sequence length: {len(pred.sequence)}")
             print(f"Trained: {trained}")
             if fit_result:
-                print(f"Epochs ran: {fit_result.epochs_ran}")
-                print(f"Best epoch: {fit_result.best_epoch}, Best val loss: {fit_result.best_val_loss:.4f}")
+                print(f"Epochs ran: {fit_result.epochs_ran}; Best epoch: {fit_result.best_epoch}; Best val: {fit_result.best_val_loss:.4f}")
             if eval_metrics:
-                print(
-                    "Eval metrics: "
-                    f"RMSD={eval_metrics['rmsd']:.4f}, "
-                    f"P={eval_metrics['contact_precision']:.4f}, "
-                    f"R={eval_metrics['contact_recall']:.4f}, "
-                    f"F1={eval_metrics['contact_f1']:.4f}, "
-                    f"DistMAE={eval_metrics['distance_mae']:.4f}"
-                )
+                print(f"Eval: RMSD={eval_metrics['rmsd']:.4f}, ContactP={eval_metrics['contact_precision']:.4f}")
             print(f"Mean confidence: {float(np.mean(pred.confidence)):.2f}")
-            print("First 5 C-alpha coordinates:")
-            for i, c in enumerate(pred.coords[:5]):
-                print(f"  {i:3d}: ({c[0]: .3f}, {c[1]: .3f}, {c[2]: .3f})")
 
 
 if __name__ == "__main__":
