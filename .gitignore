@@ -1,0 +1,6 @@
+__pycache__/
+tests/__pycache__/
+trained_models/*.npz
+trained_models/*.pt
+trained_models/*.bin
+trained_models/*.json
