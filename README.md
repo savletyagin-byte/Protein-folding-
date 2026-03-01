@@ -72,6 +72,22 @@ python protein_folding.py ACDEFGHIK --load-model trained_models/demo.json --no-e
 
 JSON output includes `e3nn_enabled` so you can verify whether true equivariant updates were active at runtime.
 
+
+## Super interface (web app)
+
+Launch the interactive UI:
+
+```bash
+python -m pip install streamlit
+streamlit run app.py
+```
+
+What you get:
+- Sidebar model controls (recycles, graph settings, e3nn toggle).
+- Train tab for uploaded PDB files.
+- Predict tab with single-view render, multi-view render, and animated rotation GIF.
+- Export tab for JSON checkpoints and predicted PDB download.
+
 ## Tests
 
 ```bash
